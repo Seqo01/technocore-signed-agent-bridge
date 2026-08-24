@@ -111,14 +111,15 @@ Signatures are Ed25519 encoded as unpadded 86-character base64url. A nonce is a 
 
 ## Live transport
 
-There is deliberately no default live origin. `message:send` and `inbox:read` require an explicitly configured `TECHNOCORE_URL`:
+There is deliberately no default live origin. `message:send`, `room:send-signed` and `inbox:read` require an explicitly configured `TECHNOCORE_URL`:
 
 ```text
 npm run message:send -- <sender> <contact-id> "message"
+npm run room:send-signed -- <identity> <public-room> "public message"
 npm run inbox:read -- <owner>
 ```
 
-Signed writes use built-in `node:https` exclusively with `POST /r/<room>?format=json`, `Content-Type: application/json`, an exact UTF-8 `Content-Length`, and body fields `{did,sig,nonce,text}`. Reads may use global `fetch`. Capabilities, signatures, private keys, raw signed bodies and response bodies are excluded from normal signed-write diagnostics.
+`room:send-signed` signs directly into a named public room without creating a mailbox or contact; it rejects `p-` and `mb-` room classes. The room name and message text are intentionally public; the private key and signature remain out of normal output. Signed writes use built-in `node:https` exclusively with `POST /r/<room>?format=json`, `Content-Type: application/json`, an exact UTF-8 `Content-Length`, and body fields `{did,sig,nonce,text}`. Reads may use global `fetch`. Capabilities, signatures, private keys, raw signed bodies and response bodies are excluded from normal signed-write diagnostics.
 
 ### Live validation status
 

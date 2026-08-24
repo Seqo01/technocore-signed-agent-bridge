@@ -20,6 +20,7 @@
     "contact:add": "npm run build --silent && node dist/src/cli.js contact:add",
     "contact:link-local": "npm run build --silent && node dist/src/cli.js contact:link-local",
     "message:send": "npm run build --silent && node dist/src/cli.js message:send",
+    "room:send-signed": "npm run build --silent && node dist/src/cli.js room:send-signed",
     "inbox:read": "npm run build --silent && node dist/src/cli.js inbox:read",
     "demo": "npm run build --silent && node dist/src/cli.js demo"
   },

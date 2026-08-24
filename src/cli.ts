@@ -12,7 +12,8 @@ function usage(): never {
     "mailbox:show <owner> | mailbox:rotate <owner> | " +
     "contact:add <owner> <contact-id> <did:key> <mb-p-room> | " +
     "contact:link-local <owner> <contact> | " +
-    "message:send <sender> <contact-id> <text> | inbox:read <owner> | demo",
+    "message:send <sender> <contact-id> <text> | " +
+    "room:send-signed <identity> <room> <text> | inbox:read <owner> | demo",
   );
 }
 
@@ -119,6 +120,18 @@ async function main(): Promise<void> {
         requireArg(args, 2),
       );
       console.log(JSON.stringify({ sent: true, seq: response.posted?.seq ?? response.last_seq }, null, 2));
+      return;
+    }
+    case "room:send-signed": {
+      const identity = requireArg(args, 0);
+      const room = requireArg(args, 1);
+      const bridge = new SignedAgentBridge(stores, liveTransport());
+      const response = await bridge.sendSignedToRoom(identity, room, requireArg(args, 2));
+      console.log(JSON.stringify({
+        sent: true,
+        room,
+        seq: response.posted?.seq ?? response.last_seq,
+      }, null, 2));
       return;
     }
     case "inbox:read": {

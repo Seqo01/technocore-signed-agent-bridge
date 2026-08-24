@@ -34,6 +34,31 @@ test("signed mailbox bridge sends, attributes and advances its local cursor", as
   }
 });
 
+test("signed public-room send needs only a local identity and persists its room nonce", async () => {
+  const temporary = await temporaryDirectory();
+  try {
+    const { paths: _paths, ...stores } = createStores(temporary.path);
+    const transport = new InMemoryTechnocoreTransport();
+    const bridge = new SignedAgentBridge(stores, transport);
+    const alice = await stores.identities.create("alice");
+
+    const response = await bridge.sendSignedToRoom("alice", "lobby", "public\nproof");
+    assert.equal(response.posted?.from, alice.did);
+    assert.equal(response.posted?.text, "public proof");
+    assert.equal(response.posted?.seq, 1);
+    assert.ok(await stores.nonces.last(alice.did, "lobby"));
+    await assert.rejects(() => stores.mailboxes.load("alice"), /does not exist/u);
+    await assert.rejects(() => stores.contacts.get("alice", "bob"), /does not exist/u);
+    await assert.rejects(
+      () => bridge.sendSignedToRoom("alice", "mb-p-0123456789abcdef", "not public"),
+      /requires a public non-mailbox room/u,
+    );
+    assert.equal(await stores.nonces.last(alice.did, "mb-p-0123456789abcdef"), undefined);
+  } finally {
+    await temporary.cleanup();
+  }
+});
+
 test("an ambiguous send consumes its nonce and is never automatically repeated", async () => {
   const temporary = await temporaryDirectory();
   try {

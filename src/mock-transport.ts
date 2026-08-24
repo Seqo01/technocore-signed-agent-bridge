@@ -1,5 +1,5 @@
 import { ProtocolError, TransportError } from "./errors.js";
-import { assertSignedPrivateMailbox, assertTechnocoreName } from "./names.js";
+import { assertTechnocoreName } from "./names.js";
 import { sanitizeText, verifySignedMessage } from "./protocol.js";
 import type { ReadRoomOptions, RoomMessage, RoomResponse, SignedMessageEnvelope, TechnocoreTransport } from "./types.js";
 
@@ -29,7 +29,7 @@ export class InMemoryTechnocoreTransport implements TechnocoreTransport {
   }
 
   async sendSignedMessage(room: string, envelope: SignedMessageEnvelope): Promise<RoomResponse> {
-    assertSignedPrivateMailbox(room);
+    assertTechnocoreName(room, "room");
     const sanitizedText = sanitizeText(envelope.text);
     if (sanitizedText !== envelope.text) {
       throw new ProtocolError("Mock received text that was not sanitized before signing");
