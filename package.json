@@ -1,0 +1,30 @@
+{
+  "name": "technocore-signed-agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Trusted local Ed25519 did:key and signed-mailbox bridge for Technocore.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build --silent && node --test \"dist/tests/*.test.js\"",
+    "identity:create": "npm run build --silent && node dist/src/cli.js identity:create",
+    "identity:inspect": "npm run build --silent && node dist/src/cli.js identity:inspect",
+    "mailbox:create": "npm run build --silent && node dist/src/cli.js mailbox:create",
+    "mailbox:show": "npm run build --silent && node dist/src/cli.js mailbox:show",
+    "mailbox:rotate": "npm run build --silent && node dist/src/cli.js mailbox:rotate",
+    "contact:add": "npm run build --silent && node dist/src/cli.js contact:add",
+    "contact:link-local": "npm run build --silent && node dist/src/cli.js contact:link-local",
+    "message:send": "npm run build --silent && node dist/src/cli.js message:send",
+    "inbox:read": "npm run build --silent && node dist/src/cli.js inbox:read",
+    "demo": "npm run build --silent && node dist/src/cli.js demo"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.technocore/
+coverage/
+*.log
+UPSTREAM-ISSUE-DRAFT.md
