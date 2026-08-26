@@ -1,12 +1,11 @@
 import {
-  createPrivateKey,
   createPublicKey,
   sign as cryptoSign,
   verify as cryptoVerify,
 } from "node:crypto";
 import { ProtocolError } from "./errors.js";
 import { assertTechnocoreName } from "./names.js";
-import type { SignedMessage, StoredIdentity } from "./types.js";
+import type { SignedMessage, UnlockedIdentity } from "./types.js";
 
 // Protocol rules adapted from flop-labs/technocore-chat at commit 8bd794b
 // (Apache-2.0) and independently implemented here in TypeScript.
@@ -129,7 +128,7 @@ export function publicKeyFromDid(did: string) {
 }
 
 export function signMessage(
-  identity: StoredIdentity,
+  identity: UnlockedIdentity,
   room: string,
   nonce: bigint | number | string,
   text: string,
@@ -141,11 +140,10 @@ export function signMessage(
     normalizedNonce,
     sanitizedText,
   );
-  const privateKey = createPrivateKey(identity.privateKeyPem);
   const signature = cryptoSign(
     null,
     Buffer.from(canonicalPayload, "utf8"),
-    privateKey,
+    identity.privateKey,
   ).toString("base64url");
   if (signature.length !== SIGNATURE_LENGTH) {
     throw new ProtocolError("Ed25519 signature did not have Technocore's required format");

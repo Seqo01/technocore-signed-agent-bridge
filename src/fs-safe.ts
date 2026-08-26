@@ -59,6 +59,52 @@ export async function atomicWriteJson(path: string, value: unknown): Promise<voi
   await atomicWriteFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+export async function atomicCreateFile(
+  path: string,
+  content: string,
+  mode = 0o600,
+): Promise<void> {
+  await ensurePrivateDirectory(dirname(path));
+  const temporary = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", mode);
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await renameWithoutReplace(temporary, path);
+    await chmod(path, mode).catch(() => undefined);
+  } catch (error) {
+    if (handle) {
+      await handle.close().catch(() => undefined);
+    }
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function atomicCreateJson(path: string, value: unknown): Promise<void> {
+  await atomicCreateFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+export async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export async function renameWithoutReplace(source: string, destination: string): Promise<void> {
+  if (await pathExists(destination)) {
+    throw new BridgeError(`Refusing to replace existing local state file ${destination}`);
+  }
+  await rename(source, destination);
+}
+
 async function lockIsStale(path: string): Promise<boolean> {
   try {
     const info = await stat(path);

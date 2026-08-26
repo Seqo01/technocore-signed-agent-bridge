@@ -5,12 +5,13 @@ import { createStores } from "../src/context.js";
 import { AmbiguousSendError } from "../src/errors.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
 import type { ReadRoomOptions, RoomResponse, SignedMessageEnvelope, TechnocoreTransport } from "../src/types.js";
-import { temporaryDirectory } from "./helpers.js";
+import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 test("signed mailbox bridge sends, attributes and advances its local cursor", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const { paths: _paths, ...stores } = createStores(temporary.path);
+    const { paths: _paths, ...stores } = createStores(temporary.path, passphrases.provider);
     const transport = new InMemoryTechnocoreTransport();
     const bridge = new SignedAgentBridge(stores, transport);
     const alice = await stores.identities.create("alice");
@@ -30,14 +31,16 @@ test("signed mailbox bridge sends, attributes and advances its local cursor", as
     }]);
     assert.deepEqual(await bridge.readInbox("bob"), [], "cursor prevents duplicate delivery");
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });
 
 test("signed public-room send needs only a local identity and persists its room nonce", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const { paths: _paths, ...stores } = createStores(temporary.path);
+    const { paths: _paths, ...stores } = createStores(temporary.path, passphrases.provider);
     const transport = new InMemoryTechnocoreTransport();
     const bridge = new SignedAgentBridge(stores, transport);
     const alice = await stores.identities.create("alice");
@@ -55,14 +58,16 @@ test("signed public-room send needs only a local identity and persists its room 
     );
     assert.equal(await stores.nonces.last(alice.did, "mb-p-0123456789abcdef"), undefined);
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });
 
 test("an ambiguous send consumes its nonce and is never automatically repeated", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const { paths: _paths, ...stores } = createStores(temporary.path);
+    const { paths: _paths, ...stores } = createStores(temporary.path, passphrases.provider);
     const alice = await stores.identities.create("alice");
     const bob = await stores.identities.create("bob");
     const bobMailbox = await stores.mailboxes.create("bob", bob.did);
@@ -84,6 +89,7 @@ test("an ambiguous send consumes its nonce and is never automatically repeated",
     const next = await stores.nonces.reserve(alice.did, bobMailbox.room);
     assert.ok(BigInt(next) > BigInt(consumed!));
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });

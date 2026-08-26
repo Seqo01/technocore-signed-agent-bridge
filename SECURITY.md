@@ -2,7 +2,11 @@
 
 ## Secrets and capabilities
 
-Private Ed25519 key files and `mb-p-*` names are sensitive local data. Do not commit `.technocore/`, paste private PEM data into prompts, logs or tickets, or treat an unlisted mailbox name as encryption. Rotate a mailbox by creating a new local owner/state set and redistributing the new capability out of band if its name leaks.
+Encrypted Ed25519 identity files, their passphrases, legacy plaintext version 1 identities and `mb-p-*` names are sensitive local data. Do not commit `.technocore/`, paste private key data or passphrases into prompts, logs or tickets, or treat an unlisted mailbox name as encryption. Rotate a mailbox by creating a new local owner/state set and redistributing the new capability out of band if its name leaks.
+
+New private keys use a version 2 encrypted identity file with scrypt and AES-256-GCM. Passphrases are accepted only through a hidden interactive TTY and are never CLI arguments. Public metadata is bound into the authenticated encryption and checked when the identity is unlocked; `identity:inspect` can show and structurally validate that public metadata without decrypting the private key. Plaintext version 1 identities are accepted only by explicit validation/migration; normal signing fails until migration succeeds.
+
+Migration requires an encrypted backup and proves that the backup, candidate and installed key all derive the exact original DID. Keep the backup offline and outside the repository/state directory. Losing the passphrase and every usable encrypted backup loses signing access permanently. Encryption does not protect an unlocked process from same-user malware or memory inspection, and deletion of former plaintext data cannot be guaranteed on SSDs, NTFS journals, snapshots or synchronized backups.
 
 The CLI prints a mailbox capability only through the explicit `mailbox:show` command. Error messages redact recognized `p-*` and `mb-p-*` names. This reduces accidental disclosure; it cannot protect a capability deliberately embedded in message text or copied elsewhere.
 

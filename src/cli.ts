@@ -5,10 +5,13 @@ import { runOfflineDemo } from "./demo.js";
 import { BridgeError } from "./errors.js";
 import { HttpTechnocoreTransport } from "./transport.js";
 import { abbreviatePublicDid, safeErrorMessage } from "./redact.js";
+import { hiddenPassphraseProvider } from "./passphrase.js";
 
 function usage(): never {
   throw new BridgeError(
-    "usage: identity:create <name> | identity:inspect <name> | mailbox:create <owner> | " +
+    "usage: identity:create <name> | identity:inspect <name> | " +
+    "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
+    "mailbox:create <owner> | " +
     "mailbox:show <owner> | mailbox:rotate <owner> | " +
     "contact:add <owner> <contact-id> <did:key> <mb-p-room> | " +
     "contact:link-local <owner> <contact> | " +
@@ -19,6 +22,11 @@ function usage(): never {
 
 function requireArg(args: string[], index: number): string {
   return args[index] ?? usage();
+}
+
+function requireBackupPath(args: string[]): string {
+  if (args.length !== 3 || args[1] !== "--backup") usage();
+  return requireArg(args, 2);
 }
 
 function liveTransport(): HttpTechnocoreTransport {
@@ -32,7 +40,7 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
-  const { paths: _paths, ...stores } = createStores();
+  const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
     case "identity:create": {
@@ -44,9 +52,33 @@ async function main(): Promise<void> {
       console.log(JSON.stringify(await stores.identities.inspect(requireArg(args, 0)), null, 2));
       return;
     }
+    case "identity:migrate": {
+      const name = requireArg(args, 0);
+      const result = await stores.identities.migrate(name, requireBackupPath(args));
+      console.log(JSON.stringify({
+        name: result.name,
+        did: result.did,
+        fingerprint: result.fingerprint,
+        migrated: result.migrated,
+        backupVerified: result.backupVerified,
+        recovered: result.recovered,
+        liveActivity: false,
+      }, null, 2));
+      return;
+    }
+    case "identity:restore": {
+      const name = requireArg(args, 0);
+      const identity = await stores.identities.restore(name, requireBackupPath(args));
+      console.log(JSON.stringify({
+        ...identity,
+        restored: true,
+        liveActivity: false,
+      }, null, 2));
+      return;
+    }
     case "mailbox:create": {
       const owner = requireArg(args, 0);
-      const identity = await stores.identities.load(owner);
+      const identity = await stores.identities.inspect(owner);
       const mailbox = await stores.mailboxes.create(owner, identity.did);
       console.log(JSON.stringify({
         owner: mailbox.owner,

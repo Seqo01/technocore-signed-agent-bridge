@@ -6,7 +6,7 @@ import { NonceStore } from "./nonce-store.js";
 import { ProtocolError } from "./errors.js";
 import { roomClasses } from "./names.js";
 import { didToPublicKeyBytes, signMessage } from "./protocol.js";
-import type { InboxMessage, RoomResponse, StoredIdentity, TechnocoreTransport } from "./types.js";
+import type { InboxMessage, RoomResponse, TechnocoreTransport, UnlockedIdentity } from "./types.js";
 
 export interface BridgeStores {
   identities: IdentityStore;
@@ -23,7 +23,7 @@ export class SignedAgentBridge {
   ) {}
 
   async sendTo(sender: string, contactId: string, text: string): Promise<RoomResponse> {
-    const identity = await this.stores.identities.load(sender);
+    const identity = await this.stores.identities.unlock(sender);
     const contact = await this.stores.contacts.get(sender, contactId);
     return this.sendSigned(identity, contact.mailbox, text);
   }
@@ -33,11 +33,11 @@ export class SignedAgentBridge {
     if (classes.includes("p") || classes.includes("mb")) {
       throw new ProtocolError("room:send-signed requires a public non-mailbox room");
     }
-    const identity = await this.stores.identities.load(sender);
+    const identity = await this.stores.identities.unlock(sender);
     return this.sendSigned(identity, room, text);
   }
 
-  private async sendSigned(identity: StoredIdentity, room: string, text: string): Promise<RoomResponse> {
+  private async sendSigned(identity: UnlockedIdentity, room: string, text: string): Promise<RoomResponse> {
     const nonce = await this.stores.nonces.reserve(identity.did, room);
     const signed = signMessage(identity, room, nonce, text);
     return this.transport.sendSignedMessage(room, {

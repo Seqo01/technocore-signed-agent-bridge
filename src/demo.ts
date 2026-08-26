@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { SignedAgentBridge } from "./bridge.js";
 import { createStores } from "./context.js";
 import { BridgeError } from "./errors.js";
@@ -18,8 +19,12 @@ export interface DemoResult {
 export async function runOfflineDemo(root?: string): Promise<DemoResult> {
   const ownsTemporaryRoot = root === undefined;
   const stateRoot = root ?? await mkdtemp(join(tmpdir(), "technocore-bridge-demo-"));
+  const passphrase = randomBytes(32);
   try {
-    const { paths: _paths, ...stores } = createStores(stateRoot);
+    const { paths: _paths, ...stores } = createStores(
+      stateRoot,
+      async () => Buffer.from(passphrase),
+    );
     const transport = new InMemoryTechnocoreTransport();
     const bridge = new SignedAgentBridge(stores, transport);
     const coordinator = await stores.identities.create("coordinator");
@@ -54,6 +59,7 @@ export async function runOfflineDemo(root?: string): Promise<DemoResult> {
       coordinatorAcceptedFrom: "worker",
     };
   } finally {
+    passphrase.fill(0);
     if (ownsTemporaryRoot) await rm(stateRoot, { recursive: true, force: true });
   }
 }

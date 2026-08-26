@@ -3,12 +3,13 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { createStores } from "../src/context.js";
 import { NonceStore } from "../src/nonce-store.js";
-import { temporaryDirectory } from "./helpers.js";
+import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 test("identity, mailbox and contacts remain local and validate mb-p capabilities", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const stores = createStores(temporary.path);
+    const stores = createStores(temporary.path, passphrases.provider);
     const alice = await stores.identities.create("alice");
     const mailbox = await stores.mailboxes.create("alice", alice.did);
     assert.match(mailbox.room, /^mb-p-[0-9a-f]{40}$/);
@@ -22,14 +23,16 @@ test("identity, mailbox and contacts remain local and validate mb-p capabilities
     assert.equal(cursorFile.includes(mailbox.room), false, "cursor state must not disclose the capability");
     assert.equal(await stores.cursors.get("alice", mailbox.room), 42);
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });
 
 test("nonce reservations are persistent, monotonic and serialized", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const stores = createStores(temporary.path);
+    const stores = createStores(temporary.path, passphrases.provider);
     const alice = await stores.identities.create("alice");
     const room = "mb-p-0123456789abcdef";
     const values = await Promise.all(Array.from({ length: 12 }, () => stores.nonces.reserve(alice.did, room)));
@@ -42,14 +45,16 @@ test("nonce reservations are persistent, monotonic and serialized", async () => 
     const next = BigInt(await reopened.reserve(alice.did, room));
     assert.ok(next > sorted.at(-1)!);
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });
 
 test("mailbox rotation atomically replaces the local capability", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const stores = createStores(temporary.path);
+    const stores = createStores(temporary.path, passphrases.provider);
     const alice = await stores.identities.create("alice");
     const original = await stores.mailboxes.create("alice", alice.did);
     const replacement = await stores.mailboxes.rotate("alice");
@@ -59,6 +64,7 @@ test("mailbox rotation atomically replaces the local capability", async () => {
     assert.equal(replacement.did, original.did);
     assert.deepEqual(persisted, replacement);
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });

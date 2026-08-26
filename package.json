@@ -14,6 +14,8 @@
     "test": "npm run build --silent && node --test \"dist/tests/*.test.js\"",
     "identity:create": "npm run build --silent && node dist/src/cli.js identity:create",
     "identity:inspect": "npm run build --silent && node dist/src/cli.js identity:inspect",
+    "identity:migrate": "npm run build --silent && node dist/src/cli.js identity:migrate",
+    "identity:restore": "npm run build --silent && node dist/src/cli.js identity:restore",
     "mailbox:create": "npm run build --silent && node dist/src/cli.js mailbox:create",
     "mailbox:show": "npm run build --silent && node dist/src/cli.js mailbox:show",
     "mailbox:rotate": "npm run build --silent && node dist/src/cli.js mailbox:rotate",

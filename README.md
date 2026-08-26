@@ -18,7 +18,7 @@ This project complements rather than replaces `technocore-mcp`.
 CLI
  └─ SignedAgentBridge
      ├─ local stores
-     │   ├─ identities: public metadata + private Ed25519 key
+     │   ├─ identities: public metadata + encrypted Ed25519 PKCS#8
      │   ├─ mailboxes: local owner + mb-p-* capability
      │   ├─ contacts: local alias -> expected DID + mailbox
      │   ├─ nonces: persistent per-DID/per-room counters
@@ -59,7 +59,18 @@ npm run identity:create -- alice
 npm run identity:inspect -- alice
 ```
 
-`identity:inspect` returns only the public DID, fingerprint and creation time. The private Ed25519 key remains in `.technocore/identities/alice.json` and is never printed or sent to Technocore.
+`identity:create` obtains and confirms an encryption passphrase through a hidden interactive TTY; the passphrase never appears in argv or normal output. New identities use the version 2 encrypted format. `identity:inspect` returns only the public DID, fingerprint and creation time and never asks for the passphrase.
+
+The private Ed25519 key is stored as PKCS#8 DER encrypted with `scrypt` (`N=2^17`, `r=8`, `p=1`, independent 32-byte salt) and AES-256-GCM (independent 12-byte IV and 16-byte authentication tag). Public identity and encryption metadata are authenticated as AAD. Signing decrypts the key only into process memory and passes a Node `KeyObject` to the signer; neither private PEM nor the passphrase is printed or sent to Technocore.
+
+Legacy plaintext version 1 identities cannot sign. They must be migrated explicitly, with an encrypted backup path outside the repository/state directory:
+
+```text
+npm run identity:migrate -- <name> --backup <offline-encrypted-backup-path>
+npm run identity:restore -- <name> --backup <offline-encrypted-backup-path>
+```
+
+Migration validates the existing private/public key and DID, writes and reopens an encrypted backup, prepares a separately encrypted candidate, then uses a lock, marker and plaintext rollback file for crash recovery. It installs the candidate only after verification and deletes the rollback only after the installed identity decrypts to the exact original DID. Rerun the same migration command after an interrupted migration. Restore refuses to overwrite an existing identity and never generates a replacement key. Losing both the passphrase and a usable encrypted backup permanently loses signing ability for that DID.
 
 Create a signed private mailbox abstraction:
 
@@ -134,13 +145,14 @@ These observations establish protocol interoperability but not continuous servic
 ## Security model
 
 - Private keys remain local and are never accepted through CLI arguments.
+- Identity private keys are encrypted at rest with passphrase-derived authenticated encryption; public inspection does not decrypt them.
 - Mailbox names are unlisted bearer capabilities, not encryption or authorization.
 - Messages are signed but remain plaintext to the service and anyone with the capability.
 - A server-verified DID proves key possession for the write, not a human or legal identity and not trustworthy content.
 - Inbox data is labeled `untrusted-external-data`; contact matching compares the returned DID with the locally expected DID.
 - Read responses do not contain the original signature, so historical records cannot be independently reverified by this client. `serverVerifiedDid` describes the configured server's representation of the record.
 - Redacted diagnostics reveal only safe transport metadata such as stage, timeout, HTTP status and normalized Content-Type.
-- On POSIX systems, local directories/files request modes `0700`/`0600`. Windows ACL safety remains the local operator's responsibility.
+- On POSIX systems, local directories/files request modes `0700`/`0600`. Windows ACL safety, offline-backup custody and passphrase recovery remain the local operator's responsibility.
 
 Read [SECURITY.md](SECURITY.md) and [THREAT-MODEL.md](THREAT-MODEL.md) before configuring a live origin.
 
@@ -152,19 +164,20 @@ npm run typecheck
 npm run build
 ```
 
-The suite covers sanitization, Ed25519 `did:key`, an upstream-compatible deterministic vector, persistent/serialized nonces, atomic mailbox rotation, contact privacy, redaction, the offline coordinator/worker flow, defensive parsing, bounded retries, and the `node:https` signed-write transport.
+The suite covers sanitization, Ed25519 `did:key`, v1-to-v2 encrypted migration with exact DID preservation, authenticated tamper detection, backup/restore, crash recovery, hidden passphrase input, persistent/serialized nonces, atomic mailbox rotation, contact privacy, redaction, the offline coordinator/worker flow, defensive parsing, bounded retries, and the `node:https` signed-write transport.
 
 ## Current limitations
 
 - No end-to-end encryption, recipient binding or mailbox access control.
-- No DID-to-person identity proof, DID resolver, key recovery or key-rotation protocol.
+- No DID-to-person identity proof, DID resolver, forgotten-passphrase recovery or key-rotation protocol.
 - No distributed nonce coordination across independent state directories.
 - No live server provisioning, room ownership workflow, signed notes or public-room discovery.
 - No MCP wrapper, LLM integration, hosted component or background daemon.
 - Remote contacts must be exchanged and verified out of band.
 - The configured server can omit, reorder or fabricate read results.
 - Upstream replay detection scans only a bounded recent room tail; sufficiently old signed requests may become replayable after that history ages out.
-- Local secrets remain vulnerable to same-user malware, filesystem compromise, backups and permissive ACLs.
+- Unlocked keys and passphrases remain vulnerable to same-user malware, process-memory inspection and compromised terminals. Encrypted files remain vulnerable to offline passphrase guessing; strong passphrases are required.
+- Secure deletion of the former plaintext v1 file cannot be guaranteed on Windows/NTFS, SSDs, snapshots or synchronized backups.
 - Live tests observed intermittent proxy/origin/client-path failures; ambiguous writes require operator review.
 
 ## Attribution and license

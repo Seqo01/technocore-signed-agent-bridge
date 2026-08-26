@@ -6,12 +6,13 @@ import { MailboxStore } from "./mailboxes.js";
 import { NonceStore } from "./nonce-store.js";
 import { bridgePaths } from "./paths.js";
 import type { TechnocoreTransport } from "./types.js";
+import type { PassphraseProvider } from "./passphrase.js";
 
-export function createStores(root?: string) {
+export function createStores(root?: string, passphrases?: PassphraseProvider) {
   const paths = bridgePaths(root);
   return {
     paths,
-    identities: new IdentityStore(paths.identities),
+    identities: new IdentityStore(paths.identities, passphrases),
     mailboxes: new MailboxStore(paths.mailboxes),
     contacts: new ContactStore(paths.contacts),
     cursors: new CursorStore(paths.cursors),
@@ -19,7 +20,11 @@ export function createStores(root?: string) {
   };
 }
 
-export function createBridge(transport: TechnocoreTransport, root?: string): SignedAgentBridge {
-  const { paths: _paths, ...stores } = createStores(root);
+export function createBridge(
+  transport: TechnocoreTransport,
+  root?: string,
+  passphrases?: PassphraseProvider,
+): SignedAgentBridge {
+  const { paths: _paths, ...stores } = createStores(root, passphrases);
   return new SignedAgentBridge(stores, transport);
 }

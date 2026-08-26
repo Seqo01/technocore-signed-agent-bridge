@@ -1,4 +1,6 @@
-export interface StoredIdentity {
+import type { KeyObject } from "node:crypto";
+
+export interface StoredIdentityV1 {
   version: 1;
   name: string;
   did: string;
@@ -8,11 +10,54 @@ export interface StoredIdentity {
   createdAt: string;
 }
 
+export interface ScryptKdfParameters {
+  name: "scrypt";
+  salt: string;
+  N: number;
+  r: number;
+  p: number;
+  keyLength: 32;
+}
+
+export interface AesGcmParameters {
+  name: "aes-256-gcm";
+  iv: string;
+  tagLength: 16;
+  tag: string;
+}
+
+export interface EncryptedPrivateKey {
+  format: "pkcs8-der";
+  encoding: "base64url";
+  kdf: ScryptKdfParameters;
+  cipher: AesGcmParameters;
+  aadVersion: 1;
+  ciphertext: string;
+}
+
+export interface StoredIdentityV2 {
+  version: 2;
+  name: string;
+  did: string;
+  fingerprint: string;
+  publicKeyPem: string;
+  createdAt: string;
+  encryptedAt: string;
+  encryptedPrivateKey: EncryptedPrivateKey;
+}
+
+export type StoredIdentity = StoredIdentityV1 | StoredIdentityV2;
+
 export interface PublicIdentity {
   name: string;
   did: string;
   fingerprint: string;
   createdAt: string;
+}
+
+export interface UnlockedIdentity extends PublicIdentity {
+  publicKeyPem: string;
+  privateKey: KeyObject;
 }
 
 export interface StoredMailbox {

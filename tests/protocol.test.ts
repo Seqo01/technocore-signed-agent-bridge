@@ -12,7 +12,7 @@ import {
   signMessage,
   verifySignedMessage,
 } from "../src/protocol.js";
-import { temporaryDirectory } from "./helpers.js";
+import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 test("sanitization exactly replaces upstream invisible categories and trims", () => {
   const input = "  a\nb\u200dc\ue000d\ud800e\u2028f\u2029g  ";
@@ -28,10 +28,11 @@ test("sanitization character limit counts Unicode code points", () => {
 
 test("Ed25519 did:key round-trips and signs the sanitized canonical payload", async () => {
   const temporary = await temporaryDirectory();
+  const passphrases = generatedPassphraseProvider();
   try {
-    const identities = new IdentityStore(temporary.path);
+    const identities = new IdentityStore(temporary.path, passphrases.provider);
     await identities.create("alice");
-    const identity = await identities.load("alice");
+    const identity = await identities.unlock("alice");
     const raw = didToPublicKeyBytes(identity.did);
     assert.equal(raw.length, 32);
     assert.equal(publicKeyBytesToDid(raw), identity.did);
@@ -47,6 +48,7 @@ test("Ed25519 did:key round-trips and signs the sanitized canonical payload", as
     const key = createPublicKey(identity.publicKeyPem).export({ format: "jwk" });
     assert.equal(Buffer.from(key.x!, "base64url").equals(raw), true);
   } finally {
+    passphrases.cleanup();
     await temporary.cleanup();
   }
 });
