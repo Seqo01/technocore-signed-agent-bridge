@@ -117,6 +117,7 @@ export interface InferenceMetadata {
 }
 
 export interface InferenceRequest {
+  requestId: string;
   taskId: string;
   taskType: string;
   input: unknown;
@@ -195,6 +196,9 @@ export interface JournalEntry {
     did: string;
   };
   privateRoomHash?: string;
+  inferenceRequestId?: string;
+  inferenceRequestHash?: string;
+  inferenceResultHash?: string;
   memoryWriteHashes?: string[];
   resultHash?: string;
   error?: SafeErrorRecord;

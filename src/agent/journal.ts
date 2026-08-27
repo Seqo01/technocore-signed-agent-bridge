@@ -80,6 +80,13 @@ function normalizeEntry(entry: JournalEntry): JournalEntry {
   if (entry.resultHash && !HASH_PATTERN.test(entry.resultHash)) {
     throw new BridgeError("Journal result hash is invalid");
   }
+  if (entry.inferenceRequestId) validateSafeId(entry.inferenceRequestId, "inference request id");
+  if (entry.inferenceRequestHash && !HASH_PATTERN.test(entry.inferenceRequestHash)) {
+    throw new BridgeError("Journal inference-request hash is invalid");
+  }
+  if (entry.inferenceResultHash && !HASH_PATTERN.test(entry.inferenceResultHash)) {
+    throw new BridgeError("Journal inference-result hash is invalid");
+  }
   if (entry.privateRoomHash && !HASH_PATTERN.test(entry.privateRoomHash)) {
     throw new BridgeError("Private-room hash is invalid");
   }
@@ -110,6 +117,9 @@ function normalizeEntry(entry: JournalEntry): JournalEntry {
     ...(entry.inference ? { inference: validateInference(entry.inference) } : {}),
     ...(entry.publicTechnocore ? { publicTechnocore: { ...entry.publicTechnocore } } : {}),
     ...(entry.privateRoomHash ? { privateRoomHash: entry.privateRoomHash } : {}),
+    ...(entry.inferenceRequestId ? { inferenceRequestId: entry.inferenceRequestId } : {}),
+    ...(entry.inferenceRequestHash ? { inferenceRequestHash: entry.inferenceRequestHash } : {}),
+    ...(entry.inferenceResultHash ? { inferenceResultHash: entry.inferenceResultHash } : {}),
     ...(entry.memoryWriteHashes ? { memoryWriteHashes: [...entry.memoryWriteHashes] } : {}),
     ...(entry.resultHash ? { resultHash: entry.resultHash } : {}),
     ...(entry.error ? { error: validateSafeError(entry.error) } : {}),

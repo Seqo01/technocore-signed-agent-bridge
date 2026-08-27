@@ -172,7 +172,7 @@ npm run typecheck
 npm run build
 ```
 
-The suite covers sanitization, Ed25519 `did:key`, v1-to-v2 encrypted migration with exact DID preservation, authenticated tamper detection, backup/restore, crash recovery, hidden passphrase input, persistent/serialized nonces, atomic mailbox rotation, contact privacy, redaction, the offline coordinator/worker flow, defensive parsing, bounded retries, and the `node:https` signed-write transport.
+The suite covers sanitization, Ed25519 `did:key`, v1-to-v2 encrypted migration with exact DID preservation, authenticated tamper detection, backup/restore, crash recovery, hidden passphrase input, persistent/serialized nonces, atomic mailbox rotation, contact privacy, redaction, the offline coordinator/worker flow, defensive parsing, bounded retries, the `node:https` signed-write transport, and the fully offline workload lifecycle across process restarts.
 
 ## Persistent Agent v1
 
@@ -182,6 +182,18 @@ The runtime supports a deliberately small safe action set and no arbitrary shell
 
 See [AGENT-ARCHITECTURE.md](AGENT-ARCHITECTURE.md) for schemas, recovery behavior, journal privacy and the FLOP adapter boundary.
 
+## Pre-testnet workloads
+
+Agent v1 has a separate, explicit workload layer for useful offline work before official FLOP testnet APIs exist:
+
+- `workload.research` combines validated task context with relevant durable memory and requires structured findings, claims, confidence, limitations and follow-up.
+- `workload.engineering` performs analysis-only root-cause, test-plan, implementation-plan, code-review or risk work. It cannot run commands or modify repositories.
+- `workload.collaboration` treats a safely persisted inbound message as untrusted data, classifies it and may produce a `send-response` proposal. The proposal always requires a separate approval and is never sent by the workload.
+
+`AgentRuntime` delegates these task types to a small static registry and `WorkloadExecutor`; it does not contain their domain logic. Each completed workload links a task ID to a deterministic inference request ID, request/result hashes, memory-write hashes and a final result hash. Raw inference requests, mailbox capabilities, signatures and private keys are not written to the activity journal.
+
+The end-to-end test creates temporary encrypted identities and runs Research, Engineering and Collaboration in three runtime sessions. It verifies the same DID binding, memory reuse after restart, persist-before-ack inbox behavior and zero automatic collaboration sends. See [WORKLOADS.md](WORKLOADS.md) for the contracts and boundaries.
+
 ## Current limitations
 
 - No end-to-end encryption, recipient binding or mailbox access control.
@@ -190,6 +202,7 @@ See [AGENT-ARCHITECTURE.md](AGENT-ARCHITECTURE.md) for schemas, recovery behavio
 - No live server provisioning, room ownership workflow, signed notes or public-room discovery.
 - No FLOP inference, network memory, wallet, faucet, token or settlement adapter until official testnet documentation exists.
 - No long-running scheduler CLI yet; Agent v1 exposes the runtime primitives and deterministic `runOnce()`/`tick()` loop for controlled hosts.
+- Workloads use supplied context, local memory and the configured inference provider; Research does not perform live web search, and proposed actions require a separate host policy/approval layer.
 - No MCP wrapper, LLM integration, hosted component or background daemon.
 - Remote contacts must be exchanged and verified out of band.
 - The configured server can omit, reorder or fabricate read results.

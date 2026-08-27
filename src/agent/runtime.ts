@@ -4,6 +4,11 @@ import { createStores } from "../context.js";
 import { roomClasses } from "../names.js";
 import type { PassphraseProvider } from "../passphrase.js";
 import type { TechnocoreTransport, UnlockedIdentity } from "../types.js";
+import { WorkloadExecutor } from "../workloads/executor.js";
+import {
+  createDefaultWorkloadRegistry,
+  type WorkloadRegistry,
+} from "../workloads/registry.js";
 import { ActivityJournal } from "./journal.js";
 import { LocalMemoryProvider } from "./memory.js";
 import { agentPaths, type AgentPaths } from "./paths.js";
@@ -85,6 +90,7 @@ export interface AgentRuntimeStartOptions {
   state?: AgentStateStore;
   journal?: ActivityJournal;
   memory?: MemoryProvider;
+  workloads?: WorkloadRegistry;
 }
 
 function requiredString(payload: Record<string, unknown>, key: string, maximum = 16_384): string {
@@ -107,6 +113,7 @@ export class AgentRuntime {
   private stopRequested = false;
   private closed = false;
   private readonly bridge: SignedAgentBridge | undefined;
+  private readonly workloadExecutor: WorkloadExecutor;
   private readonly signalHandler = (): void => {
     void this.requestStop();
   };
@@ -126,6 +133,7 @@ export class AgentRuntime {
     private readonly clock: AgentClock,
     private readonly monotonicNow: () => number,
     private readonly handlesSignals: boolean,
+    workloads: WorkloadRegistry,
   ) {
     this.identityAlias = identityAlias;
     this.paths = paths;
@@ -135,6 +143,7 @@ export class AgentRuntime {
     this.unlockedIdentity = unlockedIdentity;
     this.sessionId = sessionId;
     this.bridge = transport ? new SignedAgentBridge(stores, transport) : undefined;
+    this.workloadExecutor = new WorkloadExecutor(workloads, inference, memory, monotonicNow);
     if (handlesSignals) {
       process.once("SIGINT", this.signalHandler);
       process.once("SIGTERM", this.signalHandler);
@@ -179,6 +188,7 @@ export class AgentRuntime {
         clock,
         options.monotonicNow ?? (() => performance.now()),
         options.handleSignals ?? true,
+        options.workloads ?? createDefaultWorkloadRegistry(),
       );
     } catch (error) {
       unlocked = undefined;
@@ -259,7 +269,7 @@ export class AgentRuntime {
       case "inbound.message":
         return this.completeInboundTask(task);
       default:
-        throw new BridgeError(`Unsupported safe agent task type ${task.type}`);
+        return this.executeWorkload(task);
     }
   }
 
@@ -269,6 +279,7 @@ export class AgentRuntime {
     let result;
     try {
       result = await this.inference.infer({
+        requestId: `req_${hashValue({ taskId: task.id, attempt: task.attempts }).slice(0, 32)}`,
         taskId: task.id,
         taskType: task.type,
         input: structuredClone(task.payload.input),
@@ -444,7 +455,71 @@ export class AgentRuntime {
     return completed;
   }
 
-  async ingestInbox(): Promise<number> {
+  private async executeWorkload(task: AgentTask): Promise<AgentTask> {
+    const result = await this.workloadExecutor.execute(task, {
+      beforeInference: () => this.state.checkpointTask(
+        task.id,
+        "workload-inference-intent",
+        "possible",
+      ).then(() => undefined),
+    });
+    const inferenceRequestHash = result.outcome === "success"
+      ? result.evidence.inferenceRequestHash
+      : result.inferenceRequestHash;
+    const inferenceRequestId = result.outcome === "success"
+      ? result.evidence.inferenceRequestId
+      : result.inferenceRequestId;
+    const inferenceResultHash = result.outcome === "success"
+      ? result.evidence.inferenceResultHash
+      : result.outcome === "failure"
+        ? result.inferenceResultHash
+        : undefined;
+    const common = {
+      ...(result.metadata ? { inference: result.metadata } : {}),
+      inferenceRequestId,
+      inferenceRequestHash,
+      ...(inferenceResultHash ? { inferenceResultHash } : {}),
+    };
+    if (result.outcome === "ambiguous") {
+      const completed = await this.state.finishTask(task.id, "ambiguous", { error: result.error });
+      await this.appendTaskJournal(completed, result.journalEvent, "ambiguous", {
+        ...common,
+        error: result.error,
+      });
+      return completed;
+    }
+    if (result.outcome === "failure") {
+      if (result.retrySafe && task.attempts < task.maxAttempts) {
+        const pending = await this.state.retryTask(task.id, result.error);
+        await this.appendTaskJournal(pending, result.journalEvent, "failure", {
+          ...common,
+          error: result.error,
+        });
+        return pending;
+      }
+      const completed = await this.state.finishTask(task.id, "failed", { error: result.error });
+      await this.appendTaskJournal(completed, result.journalEvent, "failure", {
+        ...common,
+        error: result.error,
+      });
+      return completed;
+    }
+    await this.state.checkpointTask(task.id, "workload-result-persisted", "confirmed");
+    const completed = await this.state.finishTask(task.id, "succeeded", {
+      result: {
+        hash: result.evidence.finalResultHash,
+        reference: result.resultReference,
+      },
+    });
+    await this.appendTaskJournal(completed, result.journalEvent, "success", {
+      ...common,
+      resultHash: result.evidence.finalResultHash,
+      memoryWriteHashes: result.evidence.memoryWriteHashes,
+    });
+    return completed;
+  }
+
+  async ingestInbox(options: { collaborationObjective?: string } = {}): Promise<number> {
     this.assertOpen();
     if (this.stopRequested) return 0;
     const bridge = this.requireBridge();
@@ -462,11 +537,20 @@ export class AgentRuntime {
     let acknowledgeThrough = peek.previousCursor;
     for (const message of peek.messages) {
       const key = `inbound:${privateRoomHash.slice(0, 16)}:${message.seq}`;
+      const collaboration = options.collaborationObjective !== undefined;
       const task = await this.state.enqueueTask({
         id: `inbound_${hashText(key).slice(0, 32)}`,
-        type: "inbound.message",
+        type: collaboration ? "workload.collaboration" : "inbound.message",
         idempotencyKey: key,
-        payload: {
+        payload: collaboration ? {
+          senderDid: message.senderDid,
+          messageId: `${message.senderDid}:${message.seq}`,
+          seq: message.seq,
+          privateRoomHash,
+          content: message.text,
+          trust: "untrusted-external-data",
+          objective: options.collaborationObjective,
+        } : {
           seq: message.seq,
           ts: message.ts,
           senderDid: message.senderDid,
@@ -522,6 +606,7 @@ export class AgentRuntime {
     outcome: JournalEntry["outcome"],
     details: Partial<Pick<JournalEntry,
       "inference" | "publicTechnocore" | "privateRoomHash" |
+      "inferenceRequestId" | "inferenceRequestHash" | "inferenceResultHash" |
       "memoryWriteHashes" | "resultHash" | "error">>,
   ): Promise<void> {
     await this.appendJournal({
