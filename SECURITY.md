@@ -8,6 +8,10 @@ New private keys use a version 2 encrypted identity file with scrypt and AES-256
 
 Migration requires an encrypted backup and proves that the backup, candidate and installed key all derive the exact original DID. Keep the backup offline and outside the repository/state directory. Losing the passphrase and every usable encrypted backup loses signing access permanently. Encryption does not protect an unlocked process from same-user malware or memory inspection, and deletion of former plaintext data cannot be guaranteed on SSDs, NTFS journals, snapshots or synchronized backups.
 
+The optional AgentRuntime unlocks its bound v2 identity once per process, verifies the profile DID and retains only the unlocked Node `KeyObject` reference needed for that session. It never persists decrypted key material or the passphrase. A per-agent runtime lock prevents two local processes from selecting the same queue simultaneously.
+
+Agent journal records use a restrictive schema: private rooms are represented only by hashes, errors by name/code plus message hash, and monetary values by decimal strings. Capabilities, raw private-room names, signatures, signed request bodies, private keys, passphrases and authentication material are rejected. Durable memory and task state are sensitive local data even when they contain no cryptographic key; keep the entire `.technocore/` tree private.
+
 The CLI prints a mailbox capability only through the explicit `mailbox:show` command. Error messages redact recognized `p-*` and `mb-p-*` names. This reduces accidental disclosure; it cannot protect a capability deliberately embedded in message text or copied elsewhere.
 
 ## Send failure rule

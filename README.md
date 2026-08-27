@@ -59,6 +59,14 @@ npm run identity:create -- alice
 npm run identity:inspect -- alice
 ```
 
+Bind the separate persistent agent layer to that already-existing encrypted identity:
+
+```text
+npm run agent:init -- alice
+```
+
+`agent:init` unlocks the selected identity once for verification, stores only its alias and DID, performs no network activity, and never creates or rotates a DID. Each later `AgentRuntime` process unlocks the profile identity once at startup and reuses the in-memory Node `KeyObject` until shutdown.
+
 `identity:create` obtains and confirms an encryption passphrase through a hidden interactive TTY; the passphrase never appears in argv or normal output. New identities use the version 2 encrypted format. `identity:inspect` returns only the public DID, fingerprint and creation time and never asks for the passphrase.
 
 The private Ed25519 key is stored as PKCS#8 DER encrypted with `scrypt` (`N=2^17`, `r=8`, `p=1`, independent 32-byte salt) and AES-256-GCM (independent 12-byte IV and 16-byte authentication tag). Public identity and encryption metadata are authenticated as AAD. Signing decrypts the key only into process memory and passes a Node `KeyObject` to the signer; neither private PEM nor the passphrase is printed or sent to Technocore.
@@ -166,12 +174,22 @@ npm run build
 
 The suite covers sanitization, Ed25519 `did:key`, v1-to-v2 encrypted migration with exact DID preservation, authenticated tamper detection, backup/restore, crash recovery, hidden passphrase input, persistent/serialized nonces, atomic mailbox rotation, contact privacy, redaction, the offline coordinator/worker flow, defensive parsing, bounded retries, and the `node:https` signed-write transport.
 
+## Persistent Agent v1
+
+The optional agent layer adds durable goals, an idempotent task queue, sessions, checkpoints, restart recovery, an append-only evidence journal and deterministic local memory without changing the signed bridge core. `InferenceProvider` and `MemoryProvider` keep future network providers behind explicit adapter boundaries. The only inference implementation today is `DeterministicInferenceProvider`; it is offline and intended for repeatable tests.
+
+The runtime supports a deliberately small safe action set and no arbitrary shell execution. Possible external effects are checkpointed before execution. An interrupted task is returned to pending only when no external effect was possible; otherwise it becomes `ambiguous` and is not blindly replayed. Autonomous inbox ingestion persists untrusted messages before cursor acknowledgement and never treats their text as commands.
+
+See [AGENT-ARCHITECTURE.md](AGENT-ARCHITECTURE.md) for schemas, recovery behavior, journal privacy and the FLOP adapter boundary.
+
 ## Current limitations
 
 - No end-to-end encryption, recipient binding or mailbox access control.
 - No DID-to-person identity proof, DID resolver, forgotten-passphrase recovery or key-rotation protocol.
 - No distributed nonce coordination across independent state directories.
 - No live server provisioning, room ownership workflow, signed notes or public-room discovery.
+- No FLOP inference, network memory, wallet, faucet, token or settlement adapter until official testnet documentation exists.
+- No long-running scheduler CLI yet; Agent v1 exposes the runtime primitives and deterministic `runOnce()`/`tick()` loop for controlled hosts.
 - No MCP wrapper, LLM integration, hosted component or background daemon.
 - Remote contacts must be exchanged and verified out of band.
 - The configured server can omit, reorder or fabricate read results.

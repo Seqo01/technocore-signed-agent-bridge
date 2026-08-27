@@ -6,11 +6,13 @@ import { BridgeError } from "./errors.js";
 import { HttpTechnocoreTransport } from "./transport.js";
 import { abbreviatePublicDid, safeErrorMessage } from "./redact.js";
 import { hiddenPassphraseProvider } from "./passphrase.js";
+import { initializeAgent } from "./agent/runtime.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
+    "agent:init <existing-identity> | " +
     "mailbox:create <owner> | " +
     "mailbox:show <owner> | mailbox:rotate <owner> | " +
     "contact:add <owner> <contact-id> <did:key> <mb-p-room> | " +
@@ -74,6 +76,14 @@ async function main(): Promise<void> {
         restored: true,
         liveActivity: false,
       }, null, 2));
+      return;
+    }
+    case "agent:init": {
+      const result = await initializeAgent({
+        identityAlias: requireArg(args, 0),
+        passphrases: hiddenPassphraseProvider,
+      });
+      console.log(JSON.stringify(result, null, 2));
       return;
     }
     case "mailbox:create": {

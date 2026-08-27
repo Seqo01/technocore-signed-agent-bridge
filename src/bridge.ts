@@ -16,6 +16,13 @@ export interface BridgeStores {
   nonces: NonceStore;
 }
 
+export interface InboxPeekResult {
+  messages: InboxMessage[];
+  previousCursor: number;
+  firstSeq: number | null;
+  lastSeq: number;
+}
+
 export class SignedAgentBridge {
   constructor(
     private readonly stores: BridgeStores,
@@ -24,6 +31,16 @@ export class SignedAgentBridge {
 
   async sendTo(sender: string, contactId: string, text: string): Promise<RoomResponse> {
     const identity = await this.stores.identities.unlock(sender);
+    return this.sendToUnlocked(sender, identity, contactId, text);
+  }
+
+  async sendToUnlocked(
+    sender: string,
+    identity: UnlockedIdentity,
+    contactId: string,
+    text: string,
+  ): Promise<RoomResponse> {
+    if (identity.name !== sender) throw new ProtocolError("Unlocked identity does not match sender");
     const contact = await this.stores.contacts.get(sender, contactId);
     return this.sendSigned(identity, contact.mailbox, text);
   }
@@ -34,6 +51,18 @@ export class SignedAgentBridge {
       throw new ProtocolError("room:send-signed requires a public non-mailbox room");
     }
     const identity = await this.stores.identities.unlock(sender);
+    return this.sendSignedToRoomUnlocked(identity, room, text);
+  }
+
+  async sendSignedToRoomUnlocked(
+    identity: UnlockedIdentity,
+    room: string,
+    text: string,
+  ): Promise<RoomResponse> {
+    const classes = roomClasses(room);
+    if (classes.includes("p") || classes.includes("mb")) {
+      throw new ProtocolError("room:send-signed requires a public non-mailbox room");
+    }
     return this.sendSigned(identity, room, text);
   }
 
@@ -49,6 +78,14 @@ export class SignedAgentBridge {
   }
 
   async readInbox(owner: string): Promise<InboxMessage[]> {
+    const peek = await this.peekInbox(owner);
+    if (peek.lastSeq > peek.previousCursor) {
+      await this.acknowledgeInbox(owner, peek.lastSeq);
+    }
+    return peek.messages;
+  }
+
+  async peekInbox(owner: string): Promise<InboxPeekResult> {
     const mailbox = await this.stores.mailboxes.load(owner);
     const since = await this.stores.cursors.get(owner, mailbox.room);
     const view = await this.transport.readRoomJson(mailbox.room, { since, wait: 0, limit: 200 });
@@ -73,9 +110,16 @@ export class SignedAgentBridge {
         trust: "untrusted-external-data",
       });
     }
-    if (view.last_seq > since) {
-      await this.stores.cursors.advance(owner, mailbox.room, view.last_seq);
-    }
-    return inbox;
+    return {
+      messages: inbox,
+      previousCursor: since,
+      firstSeq: view.first_seq,
+      lastSeq: view.last_seq,
+    };
+  }
+
+  async acknowledgeInbox(owner: string, seq: number): Promise<void> {
+    const mailbox = await this.stores.mailboxes.load(owner);
+    await this.stores.cursors.advance(owner, mailbox.room, seq);
   }
 }

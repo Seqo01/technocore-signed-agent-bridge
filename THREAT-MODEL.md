@@ -17,6 +17,9 @@ The local filesystem and Node.js process are trusted. The configured Technocore 
 - Private keys stay in local state, are encrypted at rest with scrypt plus AES-256-GCM, and are not sent to Technocore, MCP, an LLM or CLI output.
 - Public identity inspection does not unlock the private key. Plaintext v1 signing fails until an explicit, backed-up migration proves exact DID preservation.
 - Migration uses a verified encrypted backup, candidate, lock, marker and rollback file so an interrupted migration can be resumed without generating a new identity.
+- Agent startup binds to an existing encrypted identity, unlocks once, verifies the stored profile DID and uses a single-process runtime lock.
+- Interrupted agent work is replayed only when its durable checkpoint proves that no external effect was possible. Possible post-intent effects become `ambiguous`.
+- Inbox data is persisted as untrusted, idempotent work before cursor acknowledgement and is never executed as a command.
 - Exact upstream sanitization occurs before canonicalization and signing.
 - DID parsing accepts only Ed25519 `did:key` values with the upstream multicodec prefix.
 - File locking plus same-directory atomic replacement prevents two local processes from intentionally reserving the same nonce through this store.
@@ -31,6 +34,7 @@ The local filesystem and Node.js process are trusted. The configured Technocore 
 - A weak passphrase permits offline guessing of a copied encrypted identity. A forgotten passphrase with no usable backup permanently loses signing access.
 - JavaScript and OpenSSL do not provide a complete guarantee that passphrase/key copies are erased from process memory. Buffer zeroing is best effort.
 - Deleting the v1 rollback cannot guarantee physical erasure on SSDs, NTFS journals, snapshots or synchronized backup systems.
+- Agent state and local memory may contain sensitive task or message content. Git ignore is not encryption; filesystem access and backup custody remain security boundaries.
 - A leaked `mb-p-*` name permits reading the room. `mb` blocks anonymous writes, not reads, and provides no recipient binding.
 - Signed messages are authenticated but plaintext. Traffic analysis, operator access, retention and room-name exposure remain possible.
 - Contacts are locally asserted. A wrong DID/mailbox entered by the operator is faithfully used; there is no global identity resolver.
