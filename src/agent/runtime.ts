@@ -6,6 +6,7 @@ import { validateEvidence, type TaskEvidence } from "./evidence.js";
 import { SignedAgentBridge, type BridgeStores, type InboxPeekResult } from "../bridge.js";
 import { createStores } from "../context.js";
 import { roomClasses } from "../names.js";
+import type { ReceiveStage } from "../receive-diagnostics.js";
 import type { PassphraseProvider } from "../passphrase.js";
 import type { TechnocoreTransport, UnlockedIdentity } from "../types.js";
 import { WorkloadExecutor } from "../workloads/executor.js";
@@ -39,6 +40,13 @@ import {
 
 interface StoreContext extends BridgeStores {
   paths: ReturnType<typeof createStores>["paths"];
+}
+
+export interface InboxIntakeOptions {
+  collaborationObjective?: string;
+  validate?: (peek: InboxPeekResult) => void | Promise<void>;
+  afterPersist?: (peek: InboxPeekResult) => void | Promise<void>;
+  onStage?: (stage: ReceiveStage) => void;
 }
 
 export interface InitializeAgentOptions {
@@ -642,17 +650,28 @@ export class AgentRuntime {
     return completed;
   }
 
-  async ingestInbox(options: {
-    collaborationObjective?: string;
-    validate?: (peek: InboxPeekResult) => void | Promise<void>;
-    afterPersist?: (peek: InboxPeekResult) => void | Promise<void>;
-  } = {}): Promise<number> {
+  async ingestInbox(options: InboxIntakeOptions & { since?: number } = {}): Promise<number> {
     this.assertOpen();
     if (this.stopRequested) return 0;
     const bridge = this.requireBridge();
-    const peek = await bridge.peekInbox(this.identityAlias);
+    options.onStage?.("transport");
+    const peek = await bridge.peekInbox(this.identityAlias, options.since === undefined ? {} : { since: options.since });
+    return this.persistInbox(peek, options);
+  }
+
+  /** Host-only offline continuation of an already retained, policy-validated observation.
+   * Uses the same idempotent intake/journal/ACK path; never performs a network read.
+   */
+  async persistInbox(peek: InboxPeekResult, options: InboxIntakeOptions = {}): Promise<number> {
+    this.assertOpen();
+    if (this.stopRequested) throw new BridgeError("Inbox persistence interrupted");
+    const bridge = this.requireBridge();
     const mailbox = await this.stores.mailboxes.load(this.identityAlias);
     const privateRoomHash = hashText(mailbox.room);
+    options.onStage?.("sequence-validation");
+    if (await this.stores.cursors.get(this.identityAlias, mailbox.room) !== peek.previousCursor) {
+      throw new BridgeError("Inbox cursor changed during observation");
+    }
     if (peek.lastSeq < peek.previousCursor) throw new BridgeError("Inbox epoch changed; explicit reconciliation required");
     if (peek.firstSeq !== null && peek.firstSeq > peek.previousCursor + 1) {
       await this.appendJournal({
@@ -667,6 +686,7 @@ export class AgentRuntime {
     await options.validate?.(structuredClone(peek));
     let acknowledgeThrough = peek.previousCursor;
     for (const message of peek.messages) {
+      options.onStage?.("inbound-persistence");
       const key = `inbound:${privateRoomHash.slice(0, 16)}:${message.seq}`;
       const collaboration = options.collaborationObjective !== undefined;
       const task = await this.state.enqueueTask({
@@ -693,6 +713,7 @@ export class AgentRuntime {
           trust: "untrusted-external-data",
         },
       });
+      options.onStage?.("journal-persistence");
       await this.appendJournal({
         id: `evt_${hashText(`${key}:persisted`).slice(0, 32)}`,
         taskId: task.id,
@@ -704,7 +725,9 @@ export class AgentRuntime {
       });
       acknowledgeThrough = Math.max(acknowledgeThrough, message.seq);
     }
+    options.onStage?.("receipt-checkpoint");
     await options.afterPersist?.(structuredClone(peek));
+    options.onStage?.("cursor-ack");
     if (acknowledgeThrough > peek.previousCursor) {
       await bridge.acknowledgeInbox(this.identityAlias, acknowledgeThrough);
     }

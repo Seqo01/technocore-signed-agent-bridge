@@ -16,6 +16,7 @@ import { readJsonFile } from "./fs-safe.js";
 import { resolve } from "node:path";
 import { FirstRehearsal, type AnalysisPacket } from "./rehearsal/runner.js";
 import { ALIASES, type Alias } from "./rehearsal/setup.js";
+import { FirstReceiptReconciliation } from "./rehearsal/reconciliation.js";
 
 function usage(): never {
   throw new BridgeError(
@@ -24,6 +25,8 @@ function usage(): never {
     "agent:init <existing-identity> | agent:role <alias> <role> <expected-did> | " +
     "rehearsal:prepare | rehearsal:status | rehearsal:send <action-id> <action-hash> | " +
     "rehearsal:receive <step> | rehearsal:work <alias> | rehearsal:finalize | " +
+    "rehearsal:reconcile-prepare | rehearsal:reconcile-status | " +
+    "rehearsal:reconcile-authorize <id> <hash> | rehearsal:reconcile-observe <id> <hash> | rehearsal:reconcile-complete <id> <hash> | " +
     "action:prepare-contact <sender> <contact-id> <text> | action:prepare-public <sender> <room> <text> | " +
     "action:approve <alias> <action-id> <action-hash> | " +
     "mailbox:create <owner> | " +
@@ -58,6 +61,22 @@ async function main(): Promise<void> {
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
+    case "rehearsal:reconcile-prepare":
+    case "rehearsal:reconcile-status":
+    case "rehearsal:reconcile-authorize":
+    case "rehearsal:reconcile-observe":
+    case "rehearsal:reconcile-complete": {
+      const reconciliation = new FirstReceiptReconciliation({ root: _paths.root, passphrases: hiddenPassphraseProvider });
+      const localRead = command === "rehearsal:reconcile-prepare" || command === "rehearsal:reconcile-status";
+      if (args.length !== (localRead ? 0 : 2)) usage();
+      const result = command === "rehearsal:reconcile-prepare" ? await reconciliation.prepare() :
+        command === "rehearsal:reconcile-status" ? await reconciliation.status() :
+        command === "rehearsal:reconcile-authorize" ? await reconciliation.authorize(args[0]!, args[1]!) :
+        command === "rehearsal:reconcile-observe" ? await reconciliation.observe(args[0]!, args[1]!) :
+        await reconciliation.complete(args[0]!, args[1]!);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     case "rehearsal:prepare":
     case "rehearsal:status":
     case "rehearsal:send":

@@ -134,10 +134,14 @@ export class SignedAgentBridge {
     return peek.messages;
   }
 
-  async peekInbox(owner: string): Promise<InboxPeekResult> {
+  async peekInbox(owner: string, query: { since?: number } = {}): Promise<InboxPeekResult> {
     const mailbox = await this.stores.mailboxes.load(owner);
     const since = await this.stores.cursors.get(owner, mailbox.room);
-    const view = await this.transport.readRoomJson(mailbox.room, { since, wait: 0, limit: 200 });
+    if (query.since !== undefined && (!Number.isSafeInteger(query.since) || query.since < 0)) {
+      throw new ProtocolError("Invalid inbox query cursor");
+    }
+    // An explicit observation cursor is not an acknowledgment or a persisted cursor reset.
+    const view = await this.transport.readRoomJson(mailbox.room, { since: query.since ?? since, wait: 0, limit: 200 });
     const inbox: InboxMessage[] = [];
     for (const message of view.messages) {
       let serverVerifiedDid = false;

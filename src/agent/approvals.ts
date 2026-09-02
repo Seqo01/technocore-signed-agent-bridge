@@ -15,7 +15,12 @@ export interface SignedActionEffect {
   payloadHash: string;
 }
 
-export interface ActionApproval extends SignedActionEffect {
+// Read authorization uses the same exact-effect machinery, but a separate store and effect type.
+export interface ExactActionEffect extends Omit<SignedActionEffect, "type"> {
+  type: SignedActionEffect["type"] | "technocore.reconcile-read";
+}
+
+export interface ActionApproval extends ExactActionEffect {
   version: 1;
   actionId: string;
   actionHash: string;
@@ -29,11 +34,11 @@ export class ApprovalRequiredError extends BridgeError {
   }
 }
 
-function normalizeEffect(value: SignedActionEffect): SignedActionEffect {
+function normalizeEffect(value: ExactActionEffect): ExactActionEffect {
   assertLocalAlias(value.agentAlias);
   didToPublicKeyBytes(value.agentDid);
   if (!/^[a-f0-9]{64}$/u.test(value.destinationHash) || !/^[a-f0-9]{64}$/u.test(value.payloadHash) ||
-    !["technocore.send-contact", "technocore.send-public"].includes(value.type)) {
+    !["technocore.send-contact", "technocore.send-public", "technocore.reconcile-read"].includes(value.type)) {
     throw new BridgeError("Invalid outbound effect");
   }
   return { agentAlias: value.agentAlias, agentDid: value.agentDid, type: value.type,
@@ -68,7 +73,7 @@ export class ActionApprovalStore {
     return value;
   }
 
-  async propose(effect: SignedActionEffect, actionId: string = randomUUID()): Promise<ActionApproval> {
+  async propose(effect: ExactActionEffect, actionId: string = randomUUID()): Promise<ActionApproval> {
     const normalized = normalizeEffect(effect);
     const actionHash = hashValue({ actionId, ...normalized });
     const path = this.path(effect.agentAlias, actionId);
@@ -96,7 +101,7 @@ export class ActionApprovalStore {
     });
   }
 
-  async consume(effect: SignedActionEffect, id?: string): Promise<ActionApproval> {
+  async consume(effect: ExactActionEffect, id?: string): Promise<ActionApproval> {
     const requested = await this.propose(effect, id);
     return this.locked(this.path(effect.agentAlias, requested.actionId), async () => {
       const record = await this.read(effect.agentAlias, requested.actionId);

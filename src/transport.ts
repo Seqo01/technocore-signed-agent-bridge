@@ -9,6 +9,7 @@ import {
 } from "./errors.js";
 import { assertTechnocoreName } from "./names.js";
 import { redactSecrets } from "./redact.js";
+import type { ReadProgress } from "./receive-diagnostics.js";
 import type {
   ReadRoomOptions,
   RoomMessage,
@@ -33,6 +34,8 @@ export interface HttpTransportOptions {
   maxResponseBytes?: number;
   fetch?: FetchLike;
   httpsRequest?: HttpsRequestLike;
+  readRedirect?: RequestRedirect;
+  onReadProgress?: (progress: ReadProgress) => void;
 }
 
 interface SignedPostResponse {
@@ -201,6 +204,8 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
   private readonly maxResponseBytes: number;
   private readonly fetcher: FetchLike;
   private readonly httpsRequester: HttpsRequestLike;
+  private readonly readRedirect: RequestRedirect;
+  private readonly onReadProgress: ((progress: ReadProgress) => void) | undefined;
 
   constructor(baseUrl: string, options: HttpTransportOptions = {}) {
     this.baseUrl = new URL(baseUrl);
@@ -214,6 +219,8 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? 5_000;
     this.maxResponseBytes = options.maxResponseBytes ?? 2 * 1024 * 1024;
     this.fetcher = options.fetch ?? fetch;
+    this.readRedirect = options.readRedirect ?? "follow";
+    this.onReadProgress = options.onReadProgress;
     this.httpsRequester = options.httpsRequest ?? ((url, requestOptions, callback) =>
       nodeHttpsRequest(url, requestOptions, callback));
   }
@@ -227,6 +234,7 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
   async readRoomJson(room: string, options: ReadRoomOptions = {}): Promise<RoomResponse> {
     const url = this.roomUrl(room, options, true);
     const response = await this.readRequest(url, room);
+    this.onReadProgress?.({ stage: "response-parse" });
     const body = await this.readBody(response, room);
     try {
       return parseRoomResponse(JSON.parse(body));
@@ -421,7 +429,11 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.readRetries; attempt += 1) {
       try {
-        const response = await this.fetchWithTimeout(url, { headers: { accept: "application/json, text/plain" } });
+        this.onReadProgress?.({ stage: "transport", headersReceived: false, timedOut: false });
+        const response = await this.fetchWithTimeout(url, { method: "GET", redirect: this.readRedirect, headers: { accept: "application/json, text/plain" } });
+        const media = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+        this.onReadProgress?.({ stage: "http-status", status: response.status, headersReceived: true,
+          contentType: media === "application/json" || media === "text/plain" || media === "text/html" ? media : "other" });
         if ((response.status === 429 || response.status >= 500) && attempt < this.readRetries) {
           await delay(response.status === 429 ? retryAfterMilliseconds(response.headers.get("retry-after") ?? undefined, this.maxRetryDelayMs) : Math.min(100 * 2 ** attempt, this.maxRetryDelayMs));
           continue;
@@ -432,6 +444,7 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
         }
         return response;
       } catch (error) {
+        if (error instanceof FetchAttemptError) this.onReadProgress?.({ stage: "transport", headersReceived: false, timedOut: error.timedOut });
         if (error instanceof TransportError) throw error;
         lastError = error;
         if (attempt < this.readRetries) {

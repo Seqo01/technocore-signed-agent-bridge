@@ -65,7 +65,8 @@ Changed payloads, contacts or DIDs fail closed. These approval records cannot au
 effect, and all eight actions require separate decisions. Do not use `message:send` to bypass
 the runner's step accounting, even with a valid individual approval.
 
-Only `rehearsal:send` and `rehearsal:receive` can perform network IO. Both require the exact
+Only `rehearsal:send`, `rehearsal:receive` and the separately authorized
+`rehearsal:reconcile-observe` can perform network IO. They require the exact
 canonical `TECHNOCORE_URL=https://technocore.chat`. Preparation, work and status do not create
 a live transport. Unlocks occur through the existing private interactive TTY, never argv/env
 passphrases. Send unlocks the sender; receive unlocks the recipient for AgentRuntime. Local
@@ -115,6 +116,19 @@ long polling or automatic read retry. A receipt GET uses `since=<durable cursor>
 `wait=0`; exactly one expected message and the expected next sequence must be present. Existing
 unread history therefore stops the run rather than being silently skipped.
 
+Normal receive first compares the sent sequence with the persisted cursor plus one. A known
+mismatch (including sent seq 1 with an old cursor of 1) halts with
+`stale-cursor-or-room-sequence-mismatch` **before unlock or GET**. The GET-attempt counter and
+cursor remain unchanged. This does not relax the normal next-sequence requirement.
+
+Receive failures persist a safe stage, fixed error code, allowlisted error class/cause code,
+timestamp, expected seq, prior cursor and destination hash. HTTP metadata, when observed,
+contains only status, header-arrival/timeout flags and a coarse content-type category. Stages
+distinguish preflight, identity unlock, GET intent, transport/status/parsing, message selection,
+DID/frame/payload/sequence validation, task/journal/checkpoint persistence, ACK and local completion.
+Raw exceptions, responses, private URLs, capabilities and message contents are never diagnostics.
+Attempt counters record durable **intent**, not proof of a successful GET or receipt.
+
 `AgentRuntime.ingestInbox` validates the expected message before persistence, then writes its
 idempotent task and journal evidence. The runner's receipt checkpoint is saved after those
 writes and before cursor acknowledgment. It never uses CLI `inbox:read`. Wrong/unverified DID,
@@ -128,6 +142,74 @@ without another GET, only after validating the durable inbound task and journal 
 An ambiguous send permanently halts this rehearsal and leaves its nonce/approval consumed.
 `rehearsal:status` exposes safe counters/hashes and the halt reason. No unhalt/reset command is
 provided. Do not manually edit state or erase guards to force continuation.
+
+## Separate one-time first-receipt reconciliation (requires operator approval)
+
+This narrow mechanism supports only a halted first Alice -> Bob step, successful sent seq 1,
+an unchanged Bob cursor of 1, and the exact originally prepared message hash. It is not a new
+run, arbitrary room reader, cursor reset, or a way to retry `rehearsal:receive`. Original send
+evidence, all profile/contact bindings and the entire halted manifest are checked. The existing
+manifest is never changed, unhalted or advanced, including after successful reconciliation.
+
+Local preparation and a **separate explicit read authorization**:
+
+```text
+node dist/src/cli.js rehearsal:reconcile-prepare
+node dist/src/cli.js rehearsal:reconcile-authorize <authorizationId> <authorizationHash>
+node dist/src/cli.js rehearsal:reconcile-status
+```
+
+These commands do not unlock an identity or access the network. Review the returned safe effect
+before authorizing: Bob alias/DID, step 1, mailbox/contact hash, canonical origin, exact query
+`since=0&wait=0&limit=200`, Alice DID, expected seq 1 and payload hash, old cursor, mode and original
+manifest hash. Any change invalidates authority. Read authority uses the existing exact-effect
+approval store implementation in a **separate** `reconciliation-approvals/` directory, with effect
+type `technocore.reconcile-read`. An outbound send grant cannot authorize this read. Preparation
+never grants authority, and there is no generic approve-all flag.
+
+**Only after a separate decision to make the one observation**, this command unlocks Bob through
+the usual hidden prompt and may make one GET (never a signed action):
+
+```text
+node dist/src/cli.js rehearsal:reconcile-observe <authorizationId> <authorizationHash>
+```
+
+It uses Bob's existing capability internally, `format=json`, `since=0`, `wait=0`, `limit=200`,
+zero retries and `redirect=error`. The query cursor never overwrites the saved cursor. There is
+no polling or pagination. Missing, extra/duplicate/conflicting, wrong-DID, wrong-frame/hash or
+wrong-sequence messages stop processing. Non-2xx, parse errors and transport errors also stop.
+The observation intent and approval are spent before IO; crashes cannot authorize another GET.
+
+Validation checks transport sender DID, frame.from, receiver, rehearsal/version/step, exact
+payload hash and seq. `serverVerifiedDid` is the bridge's existing trust in the configured
+Technocore server's signed lane, not independent verification of a response signature.
+
+Only the validated single message is retained in ignored private local state at
+`agents/bob/reconciliation/first-room-read-v1-step-1.json`. No raw HTTP response, unrelated message,
+mailbox capability or signature is copied there. **This retained text is still private local
+message data; do not publish the file.** Retention precedes task creation so a crash can recover.
+Processing reuses AgentRuntime's durable intake:
+
+`validated observation -> idempotent inbound task -> safe journal -> receipt checkpoint -> ACK decision`
+
+Because the saved cursor is already 1, the ACK decision performs **no cursor write**. Receipt
+evidence is the new checkpoint, bound to observation, task payload and read authorization hashes,
+not the old cursor. The inbound item remains queued; this reconciliation runs no workload,
+inference, reply or synthesis. Offline fixtures are labeled `deterministic-offline`.
+
+If task/journal/checkpoint or final local confirmation fails **after** the validated observation
+was retained, local-only completion can be invoked explicitly:
+
+```text
+node dist/src/cli.js rehearsal:reconcile-complete <authorizationId> <authorizationHash>
+```
+
+This path cannot construct a live transport and never makes another GET. It checks the retained
+hash, revalidates the receipt, and reuses the same task/journal IDs. After a checkpoint crash it
+also checks durable evidence before local completion. If the process died before retention,
+there is no local result to recover; neither command retries. Stop for operator review instead
+of deleting state, resetting counters or issuing a new grant. The original halted rehearsal
+remains unchanged in every case; a future continuation policy is outside this change.
 
 ## Security and tests
 

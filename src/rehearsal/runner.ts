@@ -20,6 +20,8 @@ import { validateEvidence } from "../agent/evidence.js";
 import { LocalSwarmRouter, validateWorkRequest } from "../swarm/router.js";
 import { assertNoSecretLikeOutput } from "../workloads/types.js";
 import { ALIASES, TEAM, type Alias } from "./setup.js";
+import { validateReceipt } from "./receipt.js";
+import { receiveFailure, type ReadProgress, type ReceiveFailure, type ReceiveStage } from "../receive-diagnostics.js";
 
 export const QUESTION = "Assess Technocore room-read reliability and edge behavior, focusing on duplicate delivery, replay handling, retention gaps, room epoch/sequence behavior, and safe agent-side recovery. Produce a concise evidence-backed engineering recommendation.";
 export const GRAPH = Object.freeze([
@@ -42,14 +44,16 @@ interface Step {
   status: "planned" | "prepared" | "post-intent" | "sent" | "get-intent" | "received" | "acknowledged";
   text?: string; taskId?: string; actionId?: string; actionHash?: string; payloadHash?: string;
   seq?: number; inboundTaskId?: string;
+  failure?: ReceiveFailure;
   observation?: { kind: "live-observation" | "deterministic-offline"; firstSeq: number | null; lastSeq: number; seq: number; messageHash: string };
 }
-interface State {
+export interface RehearsalState {
   version: 1; id: typeof ID; dids: Record<Alias, string>; destinations: string[];
   mode: "offline" | "live";
   index: number; posts: number; gets: number; halted?: string; complete: boolean;
   steps: Step[]; analyses: Partial<Record<Alias, Analysis>>;
 }
+type State = RehearsalState;
 export interface RehearsalOptions {
   root?: string;
   passphrases: PassphraseProvider;
@@ -220,11 +224,11 @@ export class FirstRehearsal {
     });
   }
 
-  private transport(): TechnocoreTransport {
+  private transport(onReadProgress?: (progress: ReadProgress) => void): TechnocoreTransport {
     if (this.options.offlineTransport) return this.options.offlineTransport;
     // Constructed only inside an explicit send/receive, never in prepare/status/work.
     if (process.env.TECHNOCORE_URL !== "https://technocore.chat") throw new BridgeError("Explicit canonical TECHNOCORE_URL is required for live rehearsal IO");
-    return new HttpTechnocoreTransport(process.env.TECHNOCORE_URL, REHEARSAL_HTTP_OPTIONS);
+    return new HttpTechnocoreTransport(process.env.TECHNOCORE_URL, { ...REHEARSAL_HTTP_OPTIONS, ...(onReadProgress ? { onReadProgress } : {}) });
   }
 
   private async runtime(alias: Alias, state: State, transport?: TechnocoreTransport, inference?: InferenceProvider) {
@@ -291,25 +295,36 @@ export class FirstRehearsal {
       if (step.status === "received") {
         await this.completeReceipt(state, to); return this.summary(state);
       }
+      const previousCursor = await this.stores.cursors.get(to, mailbox.room);
+      if (step.seq !== previousCursor + 1) {
+        step.failure = receiveFailure({ step: stepNumber, expectedSeq: step.seq!, previousCursor, stage: "preflight",
+          code: "stale-cursor-or-room-sequence-mismatch", contactHash: state.destinations[state.index]! }, new BridgeError("Sequence mismatch"));
+        return await this.halt(state, "stale-cursor-or-room-sequence-mismatch");
+      }
       if (state.gets >= 8) return await this.halt(state, "get-budget-exhausted");
-      const base = this.transport(); let called = false;
-      const denied = async (): Promise<never> => { throw new BridgeError("Operation outside rehearsal IO plan"); };
-      const transport: TechnocoreTransport = { sendSignedMessage: denied, readRoomText: denied,
-        readRoomJson: async (room, options) => {
-          if (called || room !== mailbox.room || options?.wait !== 0 || options.limit !== 200) throw new BridgeError("Unexpected rehearsal GET");
-          called = true; return base.readRoomJson(room, options);
-        } };
-      const runtime = await this.runtime(to, state, transport);
+      let stage: ReceiveStage = "preflight";
+      let http: Omit<ReadProgress, "stage"> = {};
+      let runtime: AgentRuntime | undefined;
+      const setStage = (value: ReceiveStage) => { stage = value; };
       try {
+        const base = this.transport(progress => { stage = progress.stage; const { stage: _, ...safe } = progress; http = { ...http, ...safe }; });
+        let called = false;
+        const denied = async (): Promise<never> => { throw new BridgeError("Operation outside rehearsal IO plan"); };
+        const transport: TechnocoreTransport = { sendSignedMessage: denied, readRoomText: denied,
+          readRoomJson: async (room, options) => {
+            if (called || room !== mailbox.room || options?.since !== previousCursor || options.wait !== 0 || options.limit !== 200) throw new BridgeError("Unexpected rehearsal GET");
+            called = true; return base.readRoomJson(room, options);
+          } };
+        stage = "identity-unlock";
+        runtime = await this.runtime(to, state, transport);
         await this.assertNoOtherWork(runtime, []);
+        stage = "get-intent";
         step.status = "get-intent"; state.gets++; await this.saved(state);
-        await runtime.ingestInbox({ validate: peek => {
-          const message = peek.messages[0];
-          if (peek.messages.length !== 1 || !message || !message.serverVerifiedDid || message.senderDid !== state.dids[from] ||
-            message.seq !== step.seq || message.seq !== peek.previousCursor + 1 || peek.lastSeq !== message.seq ||
-            hashValue(message.text) !== step.payloadHash) throw new BridgeError("Unexpected, replayed, missing or mismatched rehearsal message");
+        await runtime.ingestInbox({ onStage: setStage, validate: peek => {
+          validateReceipt(peek, { step: stepNumber, expectedSeq: step.seq!, previousCursor,
+            senderDid: state.dids[from], receiverDid: state.dids[to], payloadHash: step.payloadHash! }, setStage, true);
         }, afterPersist: async peek => {
-          const inbound = Object.values((await runtime.state.load()).tasks).find(t => t.type === "inbound.message" &&
+          const inbound = Object.values((await runtime!.state.load()).tasks).find(t => t.type === "inbound.message" &&
             t.payload.seq === step.seq && t.payload.senderDid === state.dids[from] && t.payload.text === step.text);
           if (!inbound) throw new BridgeError("Durable inbound receipt missing");
           step.inboundTaskId = inbound.id;
@@ -317,12 +332,17 @@ export class FirstRehearsal {
             firstSeq: peek.firstSeq, lastSeq: peek.lastSeq, seq: step.seq!, messageHash: step.payloadHash! };
           step.status = "received"; await this.saved(state);
         } });
+        stage = "local-completion";
         await runtime.runOnce(step.inboundTaskId);
-      } catch {
+        await runtime.close(); runtime = undefined;
+        stage = "cursor-ack";
+        await this.completeReceipt(state, to);
+      } catch (error) {
+        step.failure = receiveFailure({ step: stepNumber, expectedSeq: step.seq!, previousCursor, stage,
+          code: "receive-failed", contactHash: state.destinations[stepNumber - 1]!, http }, error);
         state.halted = "receipt-validation-or-persistence-failed"; await this.saved(state);
-        throw new BridgeError("Rehearsal receipt stopped; no retry or cursor reset");
-      } finally { await runtime.close(); }
-      await this.completeReceipt(state, to);
+        throw new BridgeError(`Rehearsal receipt stopped; no retry or cursor reset; stage=${step.failure.stage}; code=${step.failure.code}; errorClass=${step.failure.errorClass}`);
+      } finally { await runtime?.close(step.failure ? "failed" : "clean"); }
       return this.summary(state);
     });
   }
@@ -421,9 +441,17 @@ export class FirstRehearsal {
       logicalPostAttempts: state.posts, getAttempts: state.gets, budget: { maxPosts: 8, maxGets: 8, automaticRetries: 0 },
       steps: state.steps.map((step, index) => ({ number: index + 1, from: GRAPH[index]![0], to: GRAPH[index]![1],
         status: step.status, actionId: step.actionId, actionHash: step.actionHash, payloadHash: step.payloadHash, seq: step.seq,
-        observation: step.observation })),
+        observation: step.observation, failure: step.failure })),
       results: Object.fromEntries(Object.entries(state.analyses).map(([alias, value]) => [alias, {
         packetHash: value.packetHash, resultHash: value.evidence?.resultHash, scope: "operator-assisted-supplied-evidence-only" }])) };
   }
   async status() { return this.locked(false, async state => this.summary(state), true); }
+
+  /** Host-only read of a quarantined rehearsal under its existing lock. Never saves or advances it. */
+  async withHaltedSnapshot<T>(operation: (state: RehearsalState) => Promise<T>): Promise<T> {
+    return this.locked(false, async state => {
+      if (!state.halted) throw new BridgeError("Reconciliation requires a halted rehearsal");
+      return operation(structuredClone(state));
+    }, true);
+  }
 }
