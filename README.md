@@ -41,6 +41,11 @@ Every bridge/runtime signed send now requires a durable one-action approval befo
 reservation; existing send commands without an approval fail closed. See the local
 preparation/approval flow in [SWARM.md](SWARM.md#mandatory-outbound-approvals-breaking-safety-change).
 
+A narrowly scoped [first controlled rehearsal](REHEARSAL.md) adds a fixed eight-message,
+operator-assisted workflow. Preparation is local; every eventual signed send still needs
+its own exact approval. The runner never auto-approves, polls continuously, or treats
+deterministic fixtures as live research.
+
 ## Quick start
 
 Requirements: Node.js 22 or newer and npm.

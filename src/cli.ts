@@ -12,12 +12,18 @@ import { AgentStateStore } from "./agent/state-store.js";
 import { agentPaths } from "./agent/paths.js";
 import { InMemoryTechnocoreTransport } from "./mock-transport.js";
 import { pathExists } from "./fs-safe.js";
+import { readJsonFile } from "./fs-safe.js";
+import { resolve } from "node:path";
+import { FirstRehearsal, type AnalysisPacket } from "./rehearsal/runner.js";
+import { ALIASES, type Alias } from "./rehearsal/setup.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
     "agent:init <existing-identity> | agent:role <alias> <role> <expected-did> | " +
+    "rehearsal:prepare | rehearsal:status | rehearsal:send <action-id> <action-hash> | " +
+    "rehearsal:receive <step> | rehearsal:work <alias> | rehearsal:finalize | " +
     "action:prepare-contact <sender> <contact-id> <text> | action:prepare-public <sender> <room> <text> | " +
     "action:approve <alias> <action-id> <action-hash> | " +
     "mailbox:create <owner> | " +
@@ -52,6 +58,33 @@ async function main(): Promise<void> {
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
+    case "rehearsal:prepare":
+    case "rehearsal:status":
+    case "rehearsal:send":
+    case "rehearsal:receive":
+    case "rehearsal:work":
+    case "rehearsal:finalize": {
+      const runner = new FirstRehearsal({ root: _paths.root, passphrases: hiddenPassphraseProvider });
+      let result;
+      if (command === "rehearsal:send") {
+        if (args.length !== 2) usage();
+        result = await runner.send(args[0]!, args[1]!);
+      } else if (command === "rehearsal:receive") {
+        if (args.length !== 1 || !/^[1-8]$/u.test(args[0]!)) usage();
+        result = await runner.receive(Number(args[0]));
+      } else if (command === "rehearsal:work" || command === "rehearsal:finalize") {
+        const alias = command === "rehearsal:finalize" ? "alice" : args[0] as Alias;
+        if (args.length !== (command === "rehearsal:finalize" ? 0 : 1) || !ALIASES.includes(alias)) usage();
+        const input = await readJsonFile<AnalysisPacket | null>(resolve(_paths.root, "rehearsal-inputs", `${alias}.json`), null);
+        if (!input) throw new BridgeError("Operator analysis file is required under ignored rehearsal-inputs");
+        result = await runner.work(alias, input);
+      } else {
+        if (args.length !== 0) usage();
+        result = command === "rehearsal:prepare" ? await runner.prepare() : await runner.status();
+      }
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     case "agent:role": {
       if (args.length !== 3) usage();
       const identity = await stores.identities.inspect(requireArg(args, 0));

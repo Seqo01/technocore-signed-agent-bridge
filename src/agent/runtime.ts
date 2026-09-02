@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { ApprovalRequiredError, type ActionApproval } from "./approvals.js";
 import { AgentRoleStore, assertRoleWorkload, type AgentRole } from "./roles.js";
 import { validateEvidence, type TaskEvidence } from "./evidence.js";
-import { SignedAgentBridge, type BridgeStores } from "../bridge.js";
+import { SignedAgentBridge, type BridgeStores, type InboxPeekResult } from "../bridge.js";
 import { createStores } from "../context.js";
 import { roomClasses } from "../names.js";
 import type { PassphraseProvider } from "../passphrase.js";
@@ -325,13 +325,13 @@ export class AgentRuntime {
     }
   }
 
-  async runOnce(): Promise<RuntimeRunResult> {
+  async runOnce(expectedTaskId?: string): Promise<RuntimeRunResult> {
     this.assertOpen();
     if (this.stopRequested) {
       await this.state.setRuntimeStatus("stopping");
       return { kind: "stopping" };
     }
-    const task = await this.state.claimNextTask();
+    const task = await this.state.claimNextTask(expectedTaskId);
     if (!task) {
       await this.state.setRuntimeStatus("idle");
       return { kind: "idle" };
@@ -642,7 +642,11 @@ export class AgentRuntime {
     return completed;
   }
 
-  async ingestInbox(options: { collaborationObjective?: string } = {}): Promise<number> {
+  async ingestInbox(options: {
+    collaborationObjective?: string;
+    validate?: (peek: InboxPeekResult) => void | Promise<void>;
+    afterPersist?: (peek: InboxPeekResult) => void | Promise<void>;
+  } = {}): Promise<number> {
     this.assertOpen();
     if (this.stopRequested) return 0;
     const bridge = this.requireBridge();
@@ -659,6 +663,8 @@ export class AgentRuntime {
       });
       throw new BridgeError("Inbox retention gap; explicit reconciliation required");
     }
+    // Optional host policy cannot replace persistence or advance the cursor itself.
+    await options.validate?.(structuredClone(peek));
     let acknowledgeThrough = peek.previousCursor;
     for (const message of peek.messages) {
       const key = `inbound:${privateRoomHash.slice(0, 16)}:${message.seq}`;
@@ -698,6 +704,7 @@ export class AgentRuntime {
       });
       acknowledgeThrough = Math.max(acknowledgeThrough, message.seq);
     }
+    await options.afterPersist?.(structuredClone(peek));
     if (acknowledgeThrough > peek.previousCursor) {
       await bridge.acknowledgeInbox(this.identityAlias, acknowledgeThrough);
     }

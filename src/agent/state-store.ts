@@ -242,10 +242,11 @@ export class AgentStateStore {
     return structuredClone(state.tasks[selected.id]!);
   }
 
-  async claimNextTask(): Promise<AgentTask | undefined> {
+  async claimNextTask(expectedTaskId?: string): Promise<AgentTask | undefined> {
     let selectedId: string | undefined;
     const state = await this.update((draft, now) => {
-      selectedId = draft.queue.find((id) => draft.tasks[id]?.status === "pending");
+      selectedId = draft.queue.find((id) => draft.tasks[id]?.status === "pending" &&
+        (expectedTaskId === undefined || id === expectedTaskId));
       if (!selectedId) return;
       const task = draft.tasks[selectedId]!;
       task.status = "running";
