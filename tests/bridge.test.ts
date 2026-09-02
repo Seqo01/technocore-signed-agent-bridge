@@ -5,7 +5,7 @@ import { createStores } from "../src/context.js";
 import { AmbiguousSendError } from "../src/errors.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
 import type { ReadRoomOptions, RoomResponse, SignedMessageEnvelope, TechnocoreTransport } from "../src/types.js";
-import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
+import { approveContactSend, approvePublicSend, generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 test("signed mailbox bridge sends, attributes and advances its local cursor", async () => {
   const temporary = await temporaryDirectory();
@@ -21,7 +21,7 @@ test("signed mailbox bridge sends, attributes and advances its local cursor", as
     await stores.contacts.add("alice", "bob", bob.did, bobMailbox.room);
     await stores.contacts.add("bob", "alice", alice.did, aliceMailbox.room);
 
-    await bridge.sendTo("alice", "bob", "hello\nworker");
+    await bridge.sendTo("alice", "bob", "hello\nworker", await approveContactSend(bridge, stores, "alice", "bob", "hello\nworker"));
     const first = await bridge.readInbox("bob");
     assert.deepEqual(first.map(({ contactId, text, serverVerifiedDid, trust }) => ({ contactId, text, serverVerifiedDid, trust })), [{
       contactId: "alice",
@@ -45,7 +45,8 @@ test("signed public-room send needs only a local identity and persists its room 
     const bridge = new SignedAgentBridge(stores, transport);
     const alice = await stores.identities.create("alice");
 
-    const response = await bridge.sendSignedToRoom("alice", "lobby", "public\nproof");
+    const response = await bridge.sendSignedToRoom("alice", "lobby", "public\nproof",
+      await approvePublicSend(bridge, stores, "alice", "lobby", "public\nproof"));
     assert.equal(response.posted?.from, alice.did);
     assert.equal(response.posted?.text, "public proof");
     assert.equal(response.posted?.seq, 1);
@@ -82,7 +83,8 @@ test("an ambiguous send consumes its nonce and is never automatically repeated",
       },
     };
     const bridge = new SignedAgentBridge(stores, transport);
-    await assert.rejects(() => bridge.sendTo("alice", "bob", "once"), AmbiguousSendError);
+    const approvalId = await approveContactSend(bridge, stores, "alice", "bob", "once");
+    await assert.rejects(() => bridge.sendTo("alice", "bob", "once", approvalId), AmbiguousSendError);
     assert.equal(calls, 1);
     const consumed = await stores.nonces.last(alice.did, bobMailbox.room);
     assert.ok(consumed);

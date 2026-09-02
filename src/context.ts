@@ -1,4 +1,5 @@
 import { SignedAgentBridge } from "./bridge.js";
+import { ActionApprovalStore } from "./agent/approvals.js";
 import { ContactStore } from "./contacts.js";
 import { CursorStore } from "./cursors.js";
 import { IdentityStore } from "./identity.js";
@@ -17,6 +18,7 @@ export function createStores(root?: string, passphrases?: PassphraseProvider) {
     contacts: new ContactStore(paths.contacts),
     cursors: new CursorStore(paths.cursors),
     nonces: new NonceStore(paths.nonces),
+    approvals: new ActionApprovalStore(paths.approvals),
   };
 }
 

@@ -34,6 +34,13 @@ CLI
 
 All durable state defaults to `.technocore/` under the current directory. `TECHNOCORE_HOME` can select another location. `.technocore/` is ignored by Git. Files are written atomically; cooperating local processes serialize nonce/contact/mailbox updates with lock files.
 
+The persistent runtime also supports role-aware local teams and external peers through the
+[swarm orchestration layer](SWARM.md). Delegation transfers selected evidence, not whole
+memory stores. Independent review and specialist workloads complement Research/Engineering.
+Every bridge/runtime signed send now requires a durable one-action approval before nonce
+reservation; existing send commands without an approval fail closed. See the local
+preparation/approval flow in [SWARM.md](SWARM.md#mandatory-outbound-approvals-breaking-safety-change).
+
 ## Quick start
 
 Requirements: Node.js 22 or newer and npm.

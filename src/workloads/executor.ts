@@ -8,6 +8,7 @@ import type {
   MemoryRecord,
 } from "../agent/types.js";
 import { hashValue } from "../agent/util.js";
+import { validateEvidence } from "../agent/evidence.js";
 import type { WorkloadExecutionResult, WorkloadMemoryWrite } from "./types.js";
 import { assertNoSecretLikeOutput } from "./types.js";
 import type { WorkloadRegistry } from "./registry.js";
@@ -61,11 +62,13 @@ export class WorkloadExecutor {
     let plan;
     try {
       input = workload.validateInput(structuredClone(task.payload));
-      const memoryGroups = await Promise.all(
+      const context = task.context ? validateEvidence(task.context) : undefined;
+      const memoryGroups = context ? [] : await Promise.all(
         workload.memoryQueries(input).map((query) => this.memory.search(query)),
       );
       memories = uniqueMemories(memoryGroups.flat());
       plan = workload.createInferencePlan({ task, input, memories });
+      if (context) plan = { input: { ...plan.input as Record<string, unknown>, explicitEvidence: context.evidence } };
       assertNoSecretLikeOutput(JSON.stringify(plan.input), "Workload inference request");
     } catch (error) {
       return {

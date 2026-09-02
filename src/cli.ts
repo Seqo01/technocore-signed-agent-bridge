@@ -7,18 +7,25 @@ import { HttpTechnocoreTransport } from "./transport.js";
 import { abbreviatePublicDid, safeErrorMessage } from "./redact.js";
 import { hiddenPassphraseProvider } from "./passphrase.js";
 import { initializeAgent } from "./agent/runtime.js";
+import { AgentRoleStore, type AgentRole } from "./agent/roles.js";
+import { AgentStateStore } from "./agent/state-store.js";
+import { agentPaths } from "./agent/paths.js";
+import { InMemoryTechnocoreTransport } from "./mock-transport.js";
+import { pathExists } from "./fs-safe.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
-    "agent:init <existing-identity> | " +
+    "agent:init <existing-identity> | agent:role <alias> <role> <expected-did> | " +
+    "action:prepare-contact <sender> <contact-id> <text> | action:prepare-public <sender> <room> <text> | " +
+    "action:approve <alias> <action-id> <action-hash> | " +
     "mailbox:create <owner> | " +
     "mailbox:show <owner> | mailbox:rotate <owner> | " +
     "contact:add <owner> <contact-id> <did:key> <mb-p-room> | " +
     "contact:link-local <owner> <contact> | " +
-    "message:send <sender> <contact-id> <text> | " +
-    "room:send-signed <identity> <room> <text> | inbox:read <owner> | demo",
+    "message:send <sender> <contact-id> <text> [--action <id>] | " +
+    "room:send-signed <identity> <room> <text> [--action <id>] | inbox:read <owner> | demo",
   );
 }
 
@@ -45,6 +52,39 @@ async function main(): Promise<void> {
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
+    case "agent:role": {
+      if (args.length !== 3) usage();
+      const identity = await stores.identities.inspect(requireArg(args, 0));
+      if (identity.did !== requireArg(args, 2)) throw new BridgeError("Expected DID does not match identity");
+      const paths = agentPaths(_paths.root, identity.name);
+      const state = await new AgentStateStore(paths.state).load();
+      if (state.profile.identityAlias !== identity.name || state.profile.did !== identity.did) {
+        throw new BridgeError("Role assignment requires a matching initialized profile");
+      }
+      if (await pathExists(paths.runtimeLock)) throw new BridgeError("Stop the agent before configuring its role");
+      await new AgentRoleStore(paths.directory).assign(identity, requireArg(args, 1) as AgentRole);
+      console.log(JSON.stringify({ alias: identity.name, did: identity.did, role: args[1], liveActivity: false }, null, 2));
+      return;
+    }
+    case "action:prepare-contact":
+    case "action:prepare-public": {
+      if (args.length !== 3) usage();
+      // Preparation must never construct a live transport or unlock a key.
+      const bridge = new SignedAgentBridge(stores, new InMemoryTechnocoreTransport());
+      const action = command === "action:prepare-contact"
+        ? await bridge.prepareContactSend(requireArg(args, 0), requireArg(args, 1), requireArg(args, 2))
+        : await bridge.preparePublicSend(requireArg(args, 0), requireArg(args, 1), requireArg(args, 2));
+      console.log(JSON.stringify(action, null, 2));
+      return;
+    }
+    case "action:approve": {
+      if (args.length !== 3) usage();
+      const identity = await stores.identities.inspect(requireArg(args, 0));
+      const record = await stores.approvals.read(identity.name, requireArg(args, 1));
+      if (record.agentDid !== identity.did) throw new BridgeError("Approval identity binding mismatch");
+      console.log(JSON.stringify(await stores.approvals.grant(identity.name, record.actionId, requireArg(args, 2)), null, 2));
+      return;
+    }
     case "identity:create": {
       const identity = await stores.identities.create(requireArg(args, 0));
       console.log(JSON.stringify(identity, null, 2));
@@ -155,20 +195,23 @@ async function main(): Promise<void> {
       return;
     }
     case "message:send": {
+      if (args.length !== 3 && !(args.length === 5 && args[3] === "--action")) usage();
       const bridge = new SignedAgentBridge(stores, liveTransport());
       const response = await bridge.sendTo(
         requireArg(args, 0),
         requireArg(args, 1),
         requireArg(args, 2),
+        args[4],
       );
       console.log(JSON.stringify({ sent: true, seq: response.posted?.seq ?? response.last_seq }, null, 2));
       return;
     }
     case "room:send-signed": {
+      if (args.length !== 3 && !(args.length === 5 && args[3] === "--action")) usage();
       const identity = requireArg(args, 0);
       const room = requireArg(args, 1);
       const bridge = new SignedAgentBridge(stores, liveTransport());
-      const response = await bridge.sendSignedToRoom(identity, room, requireArg(args, 2));
+      const response = await bridge.sendSignedToRoom(identity, room, requireArg(args, 2), args[4]);
       console.log(JSON.stringify({
         sent: true,
         room,

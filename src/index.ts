@@ -25,3 +25,8 @@ export * from "./agent/runtime.js";
 export * from "./agent/state-store.js";
 export type * from "./agent/types.js";
 export * from "./agent/util.js";
+export * from "./agent/approvals.js";
+export * from "./agent/roles.js";
+export * from "./agent/evidence.js";
+export * from "./swarm/router.js";
+export * from "./swarm/external.js";

@@ -2,6 +2,9 @@ import { BridgeError } from "../errors.js";
 import { collaborationWorkload } from "./collaboration.js";
 import { engineeringWorkload } from "./engineering.js";
 import { researchWorkload } from "./research.js";
+import { reviewWorkload } from "./review.js";
+import { specialistWorkload } from "./specialist.js";
+import { coordinationWorkload } from "./coordination.js";
 import type { WorkloadDefinition } from "./types.js";
 
 type RegisteredWorkload = WorkloadDefinition<any, any>;
@@ -36,5 +39,8 @@ export function createDefaultWorkloadRegistry(): WorkloadRegistry {
     researchWorkload,
     engineeringWorkload,
     collaborationWorkload,
+    reviewWorkload,
+    specialistWorkload,
+    coordinationWorkload,
   ]);
 }

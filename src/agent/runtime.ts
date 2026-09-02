@@ -1,4 +1,8 @@
 import { AmbiguousSendError, BridgeError } from "../errors.js";
+import { resolve } from "node:path";
+import { ApprovalRequiredError, type ActionApproval } from "./approvals.js";
+import { AgentRoleStore, assertRoleWorkload, type AgentRole } from "./roles.js";
+import { validateEvidence, type TaskEvidence } from "./evidence.js";
 import { SignedAgentBridge, type BridgeStores } from "../bridge.js";
 import { createStores } from "../context.js";
 import { roomClasses } from "../names.js";
@@ -78,6 +82,7 @@ export async function initializeAgent(options: InitializeAgentOptions): Promise<
 
 export interface AgentRuntimeStartOptions {
   identityAlias: string;
+  expectedDid?: string;
   root?: string;
   passphrases: PassphraseProvider;
   inference: InferenceProvider;
@@ -134,6 +139,7 @@ export class AgentRuntime {
     private readonly monotonicNow: () => number,
     private readonly handlesSignals: boolean,
     workloads: WorkloadRegistry,
+    readonly role: AgentRole | undefined,
   ) {
     this.identityAlias = identityAlias;
     this.paths = paths;
@@ -158,19 +164,31 @@ export class AgentRuntime {
     const state = options.state ?? new AgentStateStore(paths.state, clock, ids);
     const journal = options.journal ?? new ActivityJournal(paths.journal);
     const memory = options.memory ?? new LocalMemoryProvider(paths.memory, clock);
+    if (resolve(state.path) !== paths.state || resolve(journal.path) !== paths.journal ||
+      (memory instanceof LocalMemoryProvider && resolve(memory.path) !== paths.memory)) {
+      throw new BridgeError("Injected stores must belong to the selected agent profile");
+    }
     const lock = await AgentRuntimeLock.acquire(paths.runtimeLock);
     let unlocked: UnlockedIdentity | undefined;
     let sessionId: string | undefined;
+    let profileVerified = false;
     try {
-      await state.setRuntimeStatus("booting");
       const persisted = await state.load();
       if (persisted.profile.identityAlias !== options.identityAlias) {
         throw new BridgeError("Agent profile identity alias does not match startup selection");
       }
+      const publicIdentity = await stores.identities.inspect(options.identityAlias);
+      if (publicIdentity.did !== persisted.profile.did ||
+        (options.expectedDid !== undefined && publicIdentity.did !== options.expectedDid)) {
+        throw new BridgeError("Agent profile DID does not match the unlocked identity or expected DID");
+      }
+      const role = await new AgentRoleStore(paths.directory).load(publicIdentity);
       unlocked = await stores.identities.unlock(options.identityAlias);
       if (unlocked.did !== persisted.profile.did) {
         throw new BridgeError("Agent profile DID does not match the unlocked identity");
       }
+      profileVerified = true;
+      await state.setRuntimeStatus("booting");
       await state.recoverInterruptedTasks();
       sessionId = await state.startSession(ids("session"));
       return new AgentRuntime(
@@ -189,11 +207,12 @@ export class AgentRuntime {
         options.monotonicNow ?? (() => performance.now()),
         options.handleSignals ?? true,
         options.workloads ?? createDefaultWorkloadRegistry(),
+        role,
       );
     } catch (error) {
       unlocked = undefined;
       if (sessionId) await state.endSession(sessionId, "failed").catch(() => undefined);
-      else await state.setRuntimeStatus("failed").catch(() => undefined);
+      else if (profileVerified) await state.setRuntimeStatus("failed").catch(() => undefined);
       await lock.release();
       throw error;
     }
@@ -204,7 +223,83 @@ export class AgentRuntime {
   }
 
   async enqueueTask(input: EnqueueTaskInput): Promise<AgentTask> {
+    this.assertOpen();
+    this.assertTaskAllowed(input.type);
     return this.state.enqueueTask(input);
+  }
+
+  private assertTaskAllowed(type: string): void {
+    if (this.role && !["inbound.message", "technocore.send-contact", "technocore.send-public"].includes(type)) {
+      assertRoleWorkload(this.role, type);
+    }
+  }
+
+  private actionId(task: AgentTask): string {
+    return hashValue({ did: this.did, taskId: task.id, type: task.type });
+  }
+
+  async requestOutboundApproval(taskId: string): Promise<ActionApproval> {
+    this.assertOpen();
+    const task = (await this.state.load()).tasks[taskId];
+    if (!task) throw new BridgeError("Unknown outbound task");
+    const bridge = this.requireBridge();
+    if (task.type === "technocore.send-contact" && task.payload.expectedRecipientDid !== undefined) {
+      const contact = await this.stores.contacts.get(this.identityAlias, requiredString(task.payload, "contactId", 128));
+      if (contact.did !== task.payload.expectedRecipientDid) throw new BridgeError("Outbound recipient DID changed");
+    }
+    if (task.type === "technocore.send-contact") return bridge.prepareContactSend(
+      this.identityAlias, requiredString(task.payload, "contactId", 128),
+      requiredString(task.payload, "text"), this.actionId(task));
+    if (task.type === "technocore.send-public") return bridge.preparePublicSend(
+      this.identityAlias, requiredString(task.payload, "room", 48),
+      requiredString(task.payload, "text"), this.actionId(task));
+    throw new BridgeError("Task is not a supported outbound action");
+  }
+
+  /** Operator API. Not passed to an inference provider or peer content handler. */
+  async approveOutboundTask(taskId: string, expectedActionHash: string): Promise<void> {
+    const request = await this.requestOutboundApproval(taskId);
+    if (request.actionHash !== expectedActionHash) throw new BridgeError("Approval hash mismatch");
+    if (request.status === "requested") await this.stores.approvals.grant(this.identityAlias, request.actionId, expectedActionHash);
+    else if (request.status !== "approved") throw new BridgeError("Outbound approval already spent; reconcile before follow-up");
+    await this.state.resumeAfterApproval(taskId);
+  }
+
+  async exportTaskEvidence(taskId: string): Promise<TaskEvidence> {
+    this.assertOpen();
+    const state = await this.state.load();
+    if (state.profile.did !== this.did || state.profile.identityAlias !== this.identityAlias) {
+      throw new BridgeError("Profile binding changed");
+    }
+    const task = state.tasks[taskId];
+    if (!task || task.status !== "succeeded" || !task.type.startsWith("workload.") || !task.result?.reference) {
+      throw new BridgeError("Only a completed workload can export evidence");
+    }
+    const record = await this.memory.get(task.result.reference);
+    const value = record?.value as { workload: unknown; output: unknown; actions: unknown; inferenceEvidence: {
+      requestId: string; requestHash: string; resultHash: string } } | undefined;
+    const journal = (await this.journal.read()).find(entry => entry.taskId === taskId && entry.resultHash === task.result!.hash);
+    const durable = task.result.evidence;
+    const memoryWriteHashes = durable?.memoryWriteHashes ?? journal?.memoryWriteHashes;
+    if (!value?.inferenceEvidence || !memoryWriteHashes || task.result.hash !== hashValue({
+      workload: value.workload, output: value.output, actions: value.actions,
+      inferenceRequestHash: value.inferenceEvidence.requestHash,
+      inferenceResultHash: value.inferenceEvidence.resultHash, memoryWriteHashes,
+    })) throw new BridgeError("Incomplete or changed workload evidence");
+    if (!journal && durable) {
+      // Recover a crash after durable completion but before the final journal append, without re-running inference.
+      await this.appendJournal({ id: `evt_${hashValue({ taskId, resultHash: task.result.hash, recovered: true })}`,
+        taskId, taskType: task.type, event: "workload-evidence-recovered", outcome: "success",
+        resultHash: task.result.hash, ...durable });
+    }
+    return validateEvidence({ mode: "explicit-only", evidence: [{
+      agentAlias: this.identityAlias, did: this.did, taskId, workload: task.type,
+      resultHash: task.result.hash, outputHash: hashValue(value.output), output: value.output,
+      inferenceRequestId: value.inferenceEvidence.requestId,
+      inferenceRequestHash: value.inferenceEvidence.requestHash,
+      inferenceResultHash: value.inferenceEvidence.resultHash,
+      memoryWriteHashes,
+    }] }).evidence[0]!;
   }
 
   async tick(): Promise<RuntimeRunResult> {
@@ -246,6 +341,11 @@ export class AgentRuntime {
     try {
       completed = await this.executeTask(task);
     } catch (error) {
+      if (error instanceof ApprovalRequiredError) {
+        completed = await this.state.waitForApproval(task.id);
+        await this.appendTaskJournal(completed, "outbound-approval-required", "info", { actionHash: error.actionHash });
+        return { kind: "processed", task: completed };
+      }
       completed = await this.state.finishTask(task.id, "failed", {
         error: safeErrorRecord(error),
       });
@@ -257,6 +357,7 @@ export class AgentRuntime {
   }
 
   private async executeTask(task: AgentTask): Promise<AgentTask> {
+    this.assertTaskAllowed(task.type);
     switch (task.type) {
       case "inference":
         return this.executeInference(task);
@@ -380,13 +481,16 @@ export class AgentRuntime {
     const text = requiredString(task.payload, "text");
     const contact = await this.stores.contacts.get(this.identityAlias, contactId);
     const privateRoomHash = hashText(contact.mailbox);
+    const approval = await this.requireOutboundApproval(task);
     await this.state.checkpointTask(task.id, "action-intent", "possible");
+    await this.appendTaskJournal(task, "outbound-action-intent", "info", { actionHash: approval.actionHash });
     try {
       const response = await bridge.sendToUnlocked(
         this.identityAlias,
         this.requireIdentity(),
         contactId,
         text,
+        this.actionId(task),
       );
       const seq = response.posted?.seq ?? response.last_seq;
       await this.state.checkpointTask(task.id, "action-confirmed", "confirmed");
@@ -395,6 +499,7 @@ export class AgentRuntime {
       });
       await this.appendTaskJournal(completed, "technocore-send", "success", {
         privateRoomHash,
+        actionHash: approval.actionHash,
         resultHash: completed.result!.hash,
       });
       return completed;
@@ -405,6 +510,7 @@ export class AgentRuntime {
       });
       await this.appendTaskJournal(completed, "technocore-send", "ambiguous", {
         privateRoomHash,
+        actionHash: approval.actionHash,
         error: completed.error!,
       });
       return completed;
@@ -419,9 +525,11 @@ export class AgentRuntime {
     if (classes.includes("p") || classes.includes("mb")) {
       throw new BridgeError("Agent public send requires a public room");
     }
+    const approval = await this.requireOutboundApproval(task);
     await this.state.checkpointTask(task.id, "action-intent", "possible");
+    await this.appendTaskJournal(task, "outbound-action-intent", "info", { actionHash: approval.actionHash });
     try {
-      const response = await bridge.sendSignedToRoomUnlocked(this.requireIdentity(), room, text);
+      const response = await bridge.sendSignedToRoomUnlocked(this.requireIdentity(), room, text, this.actionId(task));
       const seq = response.posted?.seq ?? response.last_seq;
       await this.state.checkpointTask(task.id, "action-confirmed", "confirmed");
       const completed = await this.state.finishTask(task.id, "succeeded", {
@@ -429,6 +537,7 @@ export class AgentRuntime {
       });
       await this.appendTaskJournal(completed, "technocore-send", "success", {
         publicTechnocore: { room, seq, did: this.did },
+        actionHash: approval.actionHash,
         resultHash: completed.result!.hash,
       });
       return completed;
@@ -438,6 +547,7 @@ export class AgentRuntime {
         error: safeErrorRecord(error),
       });
       await this.appendTaskJournal(completed, "technocore-send", "ambiguous", {
+        actionHash: approval.actionHash,
         error: completed.error!,
       });
       return completed;
@@ -453,6 +563,13 @@ export class AgentRuntime {
       resultHash,
     });
     return completed;
+  }
+
+  private async requireOutboundApproval(task: AgentTask): Promise<ActionApproval> {
+    const approval = await this.requestOutboundApproval(task.id);
+    if (approval.status === "requested") throw new ApprovalRequiredError(approval.actionId, approval.actionHash);
+    if (approval.status !== "approved") throw new BridgeError("Outbound approval spent; reconcile before follow-up");
+    return approval;
   }
 
   private async executeWorkload(task: AgentTask): Promise<AgentTask> {
@@ -509,6 +626,12 @@ export class AgentRuntime {
       result: {
         hash: result.evidence.finalResultHash,
         reference: result.resultReference,
+        evidence: {
+          inferenceRequestId: result.evidence.inferenceRequestId,
+          inferenceRequestHash: result.evidence.inferenceRequestHash,
+          inferenceResultHash: result.evidence.inferenceResultHash,
+          memoryWriteHashes: result.evidence.memoryWriteHashes,
+        },
       },
     });
     await this.appendTaskJournal(completed, result.journalEvent, "success", {
@@ -526,6 +649,7 @@ export class AgentRuntime {
     const peek = await bridge.peekInbox(this.identityAlias);
     const mailbox = await this.stores.mailboxes.load(this.identityAlias);
     const privateRoomHash = hashText(mailbox.room);
+    if (peek.lastSeq < peek.previousCursor) throw new BridgeError("Inbox epoch changed; explicit reconciliation required");
     if (peek.firstSeq !== null && peek.firstSeq > peek.previousCursor + 1) {
       await this.appendJournal({
         id: `evt_${hashText(`${this.sessionId}:inbox-retention:${peek.firstSeq}`).slice(0, 32)}`,
@@ -533,6 +657,7 @@ export class AgentRuntime {
         outcome: "info",
         privateRoomHash,
       });
+      throw new BridgeError("Inbox retention gap; explicit reconciliation required");
     }
     let acknowledgeThrough = peek.previousCursor;
     for (const message of peek.messages) {
@@ -549,6 +674,7 @@ export class AgentRuntime {
           privateRoomHash,
           content: message.text,
           trust: "untrusted-external-data",
+          serverVerifiedDid: message.serverVerifiedDid,
           objective: options.collaborationObjective,
         } : {
           seq: message.seq,
@@ -607,7 +733,7 @@ export class AgentRuntime {
     details: Partial<Pick<JournalEntry,
       "inference" | "publicTechnocore" | "privateRoomHash" |
       "inferenceRequestId" | "inferenceRequestHash" | "inferenceResultHash" |
-      "memoryWriteHashes" | "resultHash" | "error">>,
+      "memoryWriteHashes" | "resultHash" | "error" | "actionHash">>,
   ): Promise<void> {
     await this.appendJournal({
       id: `evt_${hashText(`${this.sessionId}:${task.id}:${task.attempts}:${event}`).slice(0, 32)}`,

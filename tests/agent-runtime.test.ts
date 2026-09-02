@@ -18,7 +18,7 @@ import type {
   SignedMessageEnvelope,
   TechnocoreTransport,
 } from "../src/types.js";
-import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
+import { approveContactSend, generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 function countingProvider(base: PassphraseProvider): {
   provider: PassphraseProvider;
@@ -175,14 +175,20 @@ test("one runtime unlock serves multiple signed operations without leaking signe
     try {
       await runtime.enqueueTask({
         type: "technocore.send-contact",
+        id: "send-one",
         idempotencyKey: "send-one",
         payload: { contactId: "bob", text: "offline one" },
       });
       await runtime.enqueueTask({
         type: "technocore.send-contact",
+        id: "send-two",
         idempotencyKey: "send-two",
         payload: { contactId: "bob", text: "offline two" },
       });
+      for (const taskId of ["send-one", "send-two"]) {
+        const request = await runtime.requestOutboundApproval(taskId);
+        await runtime.approveOutboundTask(taskId, request.actionHash);
+      }
       assert.equal((await runtime.runOnce()).task?.status, "succeeded");
       assert.equal((await runtime.runOnce()).task?.status, "succeeded");
       assert.equal(counted.calls(), 1, "runtime must unlock once, not once per signature");
@@ -393,7 +399,8 @@ test("inbox ingestion persists and journals before cursor acknowledgement", asyn
     await stores.contacts.add("bob", "alice", alice.did, aliceMailbox.room);
     const transport = new InMemoryTechnocoreTransport();
     const bridge = new SignedAgentBridge(stores, transport);
-    await bridge.sendTo("alice", "bob", "untrusted inbound text");
+    await bridge.sendTo("alice", "bob", "untrusted inbound text",
+      await approveContactSend(bridge, stores, "alice", "bob", "untrusted inbound text"));
     await initializeAgent({
       identityAlias: "bob",
       root: temporary.path,

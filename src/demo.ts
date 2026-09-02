@@ -35,7 +35,9 @@ export async function runOfflineDemo(root?: string): Promise<DemoResult> {
     await stores.contacts.add("worker", "coordinator", coordinator.did, coordinatorMailbox.room);
 
     const task = "return status: ready";
-    await bridge.sendTo("coordinator", "worker", task);
+    const taskApproval = await bridge.prepareContactSend("coordinator", "worker", task);
+    await stores.approvals.grant("coordinator", taskApproval.actionId, taskApproval.actionHash);
+    await bridge.sendTo("coordinator", "worker", task, taskApproval.actionId);
     const workerInbox = await bridge.readInbox("worker");
     const receivedTask = workerInbox.at(-1);
     if (!receivedTask?.serverVerifiedDid || receivedTask.contactId !== "coordinator" || receivedTask.text !== task) {
@@ -43,7 +45,9 @@ export async function runOfflineDemo(root?: string): Promise<DemoResult> {
     }
 
     const response = "status: ready";
-    await bridge.sendTo("worker", "coordinator", response);
+    const replyApproval = await bridge.prepareContactSend("worker", "coordinator", response);
+    await stores.approvals.grant("worker", replyApproval.actionId, replyApproval.actionHash);
+    await bridge.sendTo("worker", "coordinator", response, replyApproval.actionId);
     const coordinatorInbox = await bridge.readInbox("coordinator");
     const receivedResponse = coordinatorInbox.at(-1);
     if (!receivedResponse?.serverVerifiedDid || receivedResponse.contactId !== "worker" || receivedResponse.text !== response) {

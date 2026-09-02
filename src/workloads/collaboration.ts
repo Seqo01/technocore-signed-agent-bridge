@@ -110,7 +110,7 @@ export const collaborationWorkload: WorkloadDefinition<CollaborationInput, Colla
   version: 1,
   taskType: "workload.collaboration",
   validateInput,
-  memoryQueries: () => [{ scope: "collaboration" }],
+  memoryQueries: input => [{ scope: "collaboration", tag: `peer:${hashText(input.senderDid).slice(0, 16)}` }],
   createInferencePlan: ({ input, memories }) => ({
     input: {
       objective: input.objective,

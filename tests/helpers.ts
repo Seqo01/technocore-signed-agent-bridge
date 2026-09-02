@@ -8,6 +8,22 @@ import { fingerprintDid } from "../src/identity.js";
 import { publicKeyBytesToDid } from "../src/protocol.js";
 import type { PassphraseProvider } from "../src/passphrase.js";
 import type { StoredIdentityV1 } from "../src/types.js";
+import type { SignedAgentBridge, BridgeStores } from "../src/bridge.js";
+
+// Explicit test-only operator approval. Never injected as a production auto-approve default.
+export async function approveContactSend(bridge: SignedAgentBridge, stores: BridgeStores,
+  sender: string, contactId: string, text: string): Promise<string> {
+  const request = await bridge.prepareContactSend(sender, contactId, text);
+  await stores.approvals.grant(sender, request.actionId, request.actionHash);
+  return request.actionId;
+}
+
+export async function approvePublicSend(bridge: SignedAgentBridge, stores: BridgeStores,
+  sender: string, room: string, text: string): Promise<string> {
+  const request = await bridge.preparePublicSend(sender, room, text);
+  await stores.approvals.grant(sender, request.actionId, request.actionHash);
+  return request.actionId;
+}
 
 export async function temporaryDirectory(): Promise<{ path: string; cleanup: () => Promise<void> }> {
   const path = await mkdtemp(join(tmpdir(), "technocore-bridge-test-"));

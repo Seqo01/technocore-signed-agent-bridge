@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { test } from "node:test";
 import { createStores } from "../src/context.js";
+import { initializeAgent } from "../src/agent/runtime.js";
+import { readFile } from "node:fs/promises";
 import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 function invokeCli(stateRoot: string, ...args: string[]) {
@@ -75,6 +77,23 @@ test("local contact linking and mailbox rotation keep capabilities and private k
     ]);
     assert.match(rotated.stdout, /Contacts referencing the old mailbox must be relinked/u);
     assert.match(rotated.stdout, /"liveActivity": false/u);
+
+    const before = await readFile(resolve(stores.paths.identities, "alice.json"), "utf8");
+    await initializeAgent({ identityAlias: "alice", root: temporary.path, passphrases: passphrases.provider });
+    const configured = invokeCli(temporary.path, "agent:role", "alice", "coordinator", aliceIdentity.did);
+    assert.equal(configured.status, 0);
+    assert.equal(await readFile(resolve(stores.paths.identities, "alice.json"), "utf8"), before);
+    assertNoSecrets(`${configured.stdout}${configured.stderr}`, privateMaterial);
+    assert.equal(invokeCli(temporary.path, "agent:role", "alice", "engineer", bobIdentity.did).status, 1);
+
+    const prepare = invokeCli(temporary.path, "action:prepare-contact", "alice", "bob", "offline approval test");
+    assert.equal(prepare.status, 0);
+    assertNoSecrets(`${prepare.stdout}${prepare.stderr}`, [originalBobMailbox.room, replacementBobMailbox.room, ...privateMaterial]);
+    const action = JSON.parse(prepare.stdout) as { actionId: string; actionHash: string };
+    const approved = invokeCli(temporary.path, "action:approve", "alice", action.actionId, action.actionHash);
+    assert.equal(approved.status, 0);
+    assertNoSecrets(`${approved.stdout}${approved.stderr}`, [originalBobMailbox.room, ...privateMaterial]);
+    assert.equal(await readFile(resolve(stores.paths.identities, "alice.json"), "utf8"), before);
   } finally {
     passphrases.cleanup();
     await temporary.cleanup();

@@ -37,9 +37,22 @@ Successful execution persists a primary `workload-result` record and workload-sp
 
 An optional `send-response` value is data, not an executed action. It is normalized to a structured action with `requiresApproval: true`; `WorkloadExecutor` never calls Technocore.
 
+### Coordination, Review and Specialist
+
+`workload.coordination` produces decomposition plans or synthesis referencing an exact set
+of explicitly supplied evidence hashes. `workload.review` independently evaluates the original
+question, produced result and criteria, with an actual supplied-result hash check and a scoped
+VOUCH/REJECT/REVISION_REQUIRED result. It never claims live verification. `workload.specialist`
+provides distinct second opinions, edge cases, alternatives and overlooked risks.
+
+These workloads do not retrieve implicit memory. All delegated/external work uses explicit-only
+context, including Research/Engineering. Local role/DID bindings constrain workload routing and
+execution. See [SWARM.md](SWARM.md) for the evidence, external intake and approval contracts.
+
 ## Security and recovery
 
-- Agent identity unlock, DID binding, nonce management and signed transport remain unchanged.
+- Identity crypto and signed transport remain unchanged. DID binding is checked before state mutation;
+  outbound approval is now consumed at the shared bridge boundary before nonce reservation.
 - Inference failure is retried only when the provider explicitly marks it safe and the task's existing retry bound allows it. Ambiguous inference is not retried blindly.
 - Inbox ingestion writes the collaboration task and its journal record before advancing the cursor.
 - Workload output is rejected if it contains recognizable private-key, capability, bearer-token or common secret-token material.

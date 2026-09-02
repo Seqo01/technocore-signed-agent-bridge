@@ -80,6 +80,8 @@ function normalizeEntry(entry: JournalEntry): JournalEntry {
   if (entry.resultHash && !HASH_PATTERN.test(entry.resultHash)) {
     throw new BridgeError("Journal result hash is invalid");
   }
+  if (entry.actionHash && !HASH_PATTERN.test(entry.actionHash)) throw new BridgeError("Invalid approval hash");
+  if (entry.delegationId) validateSafeId(entry.delegationId, "delegation id");
   if (entry.inferenceRequestId) validateSafeId(entry.inferenceRequestId, "inference request id");
   if (entry.inferenceRequestHash && !HASH_PATTERN.test(entry.inferenceRequestHash)) {
     throw new BridgeError("Journal inference-request hash is invalid");
@@ -123,6 +125,8 @@ function normalizeEntry(entry: JournalEntry): JournalEntry {
     ...(entry.memoryWriteHashes ? { memoryWriteHashes: [...entry.memoryWriteHashes] } : {}),
     ...(entry.resultHash ? { resultHash: entry.resultHash } : {}),
     ...(entry.error ? { error: validateSafeError(entry.error) } : {}),
+    ...(entry.actionHash ? { actionHash: entry.actionHash } : {}),
+    ...(entry.delegationId ? { delegationId: entry.delegationId } : {}),
   };
   const serialized = JSON.stringify(normalized);
   if (

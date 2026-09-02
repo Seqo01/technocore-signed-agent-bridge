@@ -1,4 +1,5 @@
 import { BridgeError } from "../errors.js";
+import { validateEvidence } from "./evidence.js";
 import {
   atomicCreateJson,
   atomicWriteJson,
@@ -195,6 +196,7 @@ export class AgentStateStore {
       throw new BridgeError("Task type has an invalid local format");
     }
     const payload = structuredClone(input.payload ?? {});
+    const context = input.context ? validateEvidence(input.context) : undefined;
     let selected!: AgentTask;
     const state = await this.update((draft, now) => {
       const duplicate = Object.values(draft.tasks).find(
@@ -204,7 +206,8 @@ export class AgentStateStore {
         const same =
           duplicate.type === input.type &&
           duplicate.goalId === input.goalId &&
-          hashValue(duplicate.payload) === hashValue(payload);
+          hashValue(duplicate.payload) === hashValue(payload) &&
+          hashValue(duplicate.context ?? null) === hashValue(context ?? null);
         if (!same) throw new BridgeError("Task idempotency key was reused with different input");
         selected = duplicate;
         return;
@@ -229,6 +232,7 @@ export class AgentStateStore {
         createdAt: now,
         updatedAt: now,
         payload,
+        ...(context ? { context } : {}),
         checkpoint,
       };
       draft.tasks[id] = selected;
@@ -255,6 +259,30 @@ export class AgentStateStore {
       draft.runtime.activeTaskId = task.id;
     });
     return selectedId ? structuredClone(state.tasks[selectedId]) : undefined;
+  }
+
+  async waitForApproval(taskId: string): Promise<AgentTask> {
+    const state = await this.update((draft, now) => {
+      const task = draft.tasks[taskId];
+      if (!task || task.status !== "running") throw new BridgeError("Task is not running");
+      task.status = "awaiting-approval";
+      task.checkpoint = { phase: "awaiting-approval", externalEffect: "none", updatedAt: now };
+      task.updatedAt = now;
+      draft.checkpoints[task.id]!.push(task.checkpoint);
+      draft.runtime.status = "idle";
+      delete draft.runtime.activeTaskId;
+    });
+    return structuredClone(state.tasks[taskId]!);
+  }
+
+  async resumeAfterApproval(taskId: string): Promise<void> {
+    await this.update((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task || !["pending", "awaiting-approval"].includes(task.status)) {
+        throw new BridgeError("Task cannot resume after approval");
+      }
+      task.status = "pending";
+    });
   }
 
   async checkpointTask(

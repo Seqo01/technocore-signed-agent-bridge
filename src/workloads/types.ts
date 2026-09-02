@@ -134,6 +134,7 @@ export function assertNoSecretLikeOutput(value: string, label: string): void {
     /-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----/u.test(value) ||
     /\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{12,}\b/u.test(value) ||
     /\bBearer\s+[A-Za-z0-9._~-]{12,}\b/iu.test(value)
+    || /"(?:privateKeyPem|privateKey|encryptedPrivateKey|passphrase|authorization|signedRequestBody)"\s*:/iu.test(value)
   ) {
     throw new BridgeError(`${label} contains forbidden secret-like material`);
   }

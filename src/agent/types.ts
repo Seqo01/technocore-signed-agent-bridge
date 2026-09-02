@@ -1,5 +1,8 @@
+import type { ExplicitTaskContext } from "./evidence.js";
+
 export type AgentTaskStatus =
   | "pending"
+  | "awaiting-approval"
   | "running"
   | "succeeded"
   | "failed"
@@ -47,6 +50,12 @@ export interface SafeErrorRecord {
 export interface AgentTaskResult {
   hash: string;
   reference?: string;
+  evidence?: {
+    inferenceRequestId: string;
+    inferenceRequestHash: string;
+    inferenceResultHash: string;
+    memoryWriteHashes: string[];
+  };
 }
 
 export interface AgentTask {
@@ -62,6 +71,7 @@ export interface AgentTask {
   startedAt?: string;
   finishedAt?: string;
   payload: Record<string, unknown>;
+  context?: ExplicitTaskContext;
   checkpoint: AgentCheckpoint;
   result?: AgentTaskResult;
   error?: SafeErrorRecord;
@@ -97,6 +107,7 @@ export interface EnqueueTaskInput {
   goalId?: string;
   idempotencyKey: string;
   payload?: Record<string, unknown>;
+  context?: ExplicitTaskContext;
   maxAttempts?: number;
 }
 
@@ -202,6 +213,8 @@ export interface JournalEntry {
   memoryWriteHashes?: string[];
   resultHash?: string;
   error?: SafeErrorRecord;
+  actionHash?: string;
+  delegationId?: string;
 }
 
 export interface RuntimeRunResult {

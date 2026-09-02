@@ -7,6 +7,7 @@ export interface BridgePaths {
   contacts: string;
   cursors: string;
   nonces: string;
+  approvals: string;
 }
 export function bridgePaths(root?: string): BridgePaths {
   const resolved = resolve(
@@ -19,5 +20,6 @@ export function bridgePaths(root?: string): BridgePaths {
     contacts: resolve(resolved, "contacts"),
     cursors: resolve(resolved, "cursors"),
     nonces: resolve(resolved, "nonces.json"),
+    approvals: resolve(resolved, "approvals"),
   };
 }
