@@ -17,7 +17,7 @@ export interface SignedActionEffect {
 
 // Read authorization uses the same exact-effect machinery, but a separate store and effect type.
 export interface ExactActionEffect extends Omit<SignedActionEffect, "type"> {
-  type: SignedActionEffect["type"] | "technocore.reconcile-read";
+  type: SignedActionEffect["type"] | "technocore.reconcile-read" | "technocore.reconcile-send-read";
 }
 
 export interface ActionApproval extends ExactActionEffect {
@@ -38,7 +38,7 @@ function normalizeEffect(value: ExactActionEffect): ExactActionEffect {
   assertLocalAlias(value.agentAlias);
   didToPublicKeyBytes(value.agentDid);
   if (!/^[a-f0-9]{64}$/u.test(value.destinationHash) || !/^[a-f0-9]{64}$/u.test(value.payloadHash) ||
-    !["technocore.send-contact", "technocore.send-public", "technocore.reconcile-read"].includes(value.type)) {
+    !["technocore.send-contact", "technocore.send-public", "technocore.reconcile-read", "technocore.reconcile-send-read"].includes(value.type)) {
     throw new BridgeError("Invalid outbound effect");
   }
   return { agentAlias: value.agentAlias, agentDid: value.agentDid, type: value.type,

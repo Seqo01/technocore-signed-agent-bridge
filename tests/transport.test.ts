@@ -5,6 +5,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { AmbiguousSendError, ProtocolError, TransportError } from "../src/errors.js";
 import { HttpTechnocoreTransport, type HttpsRequestLike } from "../src/transport.js";
+import { SignedPostRejectedError } from "../src/send-diagnostics.js";
 import { roomFixture } from "./helpers.js";
 
 function jsonResponse(value: unknown, status = 200, headers?: HeadersInit): Response {
@@ -340,9 +341,30 @@ test("malformed responses fail closed and capability names are redacted", async 
   });
   await assert.rejects(
     () => rejected.sendSignedMessage(room, { did: "did:key:test", sig: "x", nonce: "1", text: "hello" }),
-    (error: unknown) => error instanceof TransportError &&
+    (error: unknown) => error instanceof SignedPostRejectedError &&
       !error.message.includes(room) &&
       !error.message.includes(`bad room ${room}`) &&
-      error.message.includes("REDACTED"),
+      error.status === 400 && error.diagnostics.endpoint.includes("REDACTED"),
   );
+});
+
+test("signed POST redirect is ambiguous, never followed or retried", async () => {
+  const https = fakeHttps([{ kind: "response", status: 302, headers: { "content-type": "text/plain", location: "https://example.test/elsewhere" } }]);
+  const transport = new HttpTechnocoreTransport("https://example.test", { httpsRequest: https.request });
+  await assert.rejects(() => transport.sendSignedMessage("test-room", signedFixture()), AmbiguousSendError);
+  assert.equal(https.calls.length, 1);
+});
+
+test("GET response body stall is bounded after headers, cancels reader and does not retry", async () => {
+  let calls = 0, cancelled = false;
+  const transport = new HttpTechnocoreTransport("https://example.test", { readRetries: 0, timeoutMs: 10,
+    fetch: async () => { calls++; return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { "content-type": "application/json" } }); } });
+  await assert.rejects(() => transport.readRoomJson("test-room"), /body timed out/);
+  assert.equal(calls, 1); assert.equal(cancelled, true);
+});
+
+test("GET response byte limit interrupts streaming before persisting any body", async () => {
+  const transport = new HttpTechnocoreTransport("https://example.test", { readRetries: 0, maxResponseBytes: 8,
+    fetch: async () => new Response("oversized private response") });
+  await assert.rejects(() => transport.readRoomJson("test-room"), error => error instanceof TransportError && !error.message.includes("private response"));
 });

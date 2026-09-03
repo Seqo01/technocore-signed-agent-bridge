@@ -9,6 +9,7 @@ import { initializeAgent } from "../src/agent/runtime.js";
 import { AgentRoleStore } from "../src/agent/roles.js";
 import { atomicWriteJson } from "../src/fs-safe.js";
 import { AgentStateStore } from "../src/agent/state-store.js";
+import { agentPaths } from "../src/agent/paths.js";
 import { ActivityJournal } from "../src/agent/journal.js";
 import { ActionApprovalStore } from "../src/agent/approvals.js";
 import { CursorStore } from "../src/cursors.js";
@@ -17,6 +18,9 @@ import type { RecoveryBoundary } from "../src/rehearsal/recovery.js";
 import { FirstReceiptReconciliation, RECONCILIATION_QUERY } from "../src/rehearsal/reconciliation.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
 import { AmbiguousSendError, TransportError } from "../src/errors.js";
+import { SignedPostRejectedError } from "../src/send-diagnostics.js";
+import { SendReconciliation, SEND_READ_QUERY, type SendRecoveryBoundary } from "../src/rehearsal/send-reconciliation.js";
+import { HttpTechnocoreTransport } from "../src/transport.js";
 import type { ReadRoomOptions, RoomResponse, SignedMessageEnvelope } from "../src/types.js";
 import { FirstRehearsal, GRAPH, REHEARSAL_HTTP_OPTIONS, type AnalysisPacket } from "../src/rehearsal/runner.js";
 import { ALIASES, TEAM, prepareRehearsalContacts, type Alias } from "../src/rehearsal/setup.js";
@@ -24,14 +28,16 @@ import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 class FixtureTransport extends InMemoryTechnocoreTransport {
   posts = 0; gets = 0; insidePost = false;
-  failPost: "ambiguous" | "429" | undefined;
+  failPost: "ambiguous" | "generic" | "429" | "400" | undefined;
   mutate: ((view: RoomResponse) => RoomResponse) | undefined;
   beforeRead: (() => Promise<void>) | undefined;
   queries: ReadRoomOptions[] = [];
   override async sendSignedMessage(room: string, envelope: SignedMessageEnvelope) {
     this.posts++;
     if (this.failPost === "ambiguous") throw new AmbiguousSendError("Synthetic uncertainty");
-    if (this.failPost === "429") throw new TransportError("Synthetic refusal", 429);
+    if (this.failPost === "generic") throw Object.assign(new TypeError("Synthetic post-dispatch exception"), { code: "ECONNRESET" });
+    if (this.failPost === "429" || this.failPost === "400") throw new SignedPostRejectedError({ stage: "response-status", status: Number(this.failPost),
+      headersReceived: true, timedOut: false, bodyStarted: true, contentType: "text/plain", endpoint: "https://example.test/r/[REDACTED_CAPABILITY]" });
     this.insidePost = true;
     try { return await super.sendSignedMessage(room, envelope); } finally { this.insidePost = false; }
   }
@@ -171,14 +177,19 @@ test("controlled rehearsal: fixed graph, exact approval, durable recovery and no
       assert.equal(await f.stores.nonces.last(action.senderDid, (await f.stores.mailboxes.load("bob")).room), undefined);
     });
 
-    for (const failure of ["ambiguous", "429"] as const) await t.test(`${failure} stops after one POST and cannot be retried`, async () => {
+    for (const failure of ["ambiguous", "generic", "429"] as const) await t.test(`${failure} stops after one POST and cannot be retried`, async () => {
       const f = await fixture(); const action = await f.runner.prepare(); await f.approve(action);
       f.transport.failPost = failure;
       await assert.rejects(() => f.runner.send(action.actionId!, action.actionHash!));
       await assert.rejects(() => new FirstRehearsal(f.options).send(action.actionId!, action.actionHash!));
       await assert.rejects(() => f.runner.receive(1));
       assert.equal(f.transport.posts, 1); assert.equal(f.transport.gets, 0);
-      assert.equal((await f.stores.approvals.read("alice", action.actionId!)).status, failure === "ambiguous" ? "ambiguous" : "failed");
+      assert.equal((await f.stores.approvals.read("alice", action.actionId!)).status, failure === "429" ? "failed" : "ambiguous");
+      if (failure === "generic") {
+        const task = (await new AgentStateStore(agentPaths(f.root, "alice").state).load()).tasks.rehearsal_send_1!;
+        assert.equal(task.status, "ambiguous"); assert.equal(task.error?.outbound?.causeCode, "ECONNRESET");
+        assert.equal(task.error?.outbound?.dispatchBegan, true); assert.equal(task.error?.outbound?.nonceReservation, "reserved");
+      }
       assert.equal(REHEARSAL_HTTP_OPTIONS.rateLimitRetries, 0); assert.equal(REHEARSAL_HTTP_OPTIONS.readRetries, 0);
     });
 
@@ -695,6 +706,186 @@ test("controlled rehearsal: fixed graph, exact approval, durable recovery and no
       await f.unchanged();
     });
 
+    // Build the historical Step 2 failure shape solely from temporary generated identities.
+    const sendSeed = await recoveryFixture(); await sendSeed.apply();
+    await editJson(sendSeed.runner.path, s => { s.mode = "offline"; });
+    const sendTransport = new FixtureTransport(); sendTransport.failPost = "400";
+    const sendRunner = new FirstRehearsal({ root: sendSeed.root, passphrases: passphrases.provider, offlineTransport: sendTransport });
+    await sendRunner.work("bob", analysis("bob"));
+    const outbound = await sendRunner.prepare();
+    await createStores(sendSeed.root).approvals.grant("bob", outbound.actionId!, outbound.actionHash!);
+    await assert.rejects(() => sendRunner.send(outbound.actionId!, outbound.actionHash!));
+    const sendManifest = JSON.parse(await readFile(sendRunner.path, "utf8"));
+    assert.equal(sendManifest.halted, "send-failed"); assert.equal(sendManifest.steps[1].status, "post-intent");
+    const bobFailure = JSON.parse(await readFile(resolve(sendSeed.root, "agents/bob/state.json"), "utf8")).tasks.rehearsal_send_2;
+    assert.equal(bobFailure.status, "failed"); assert.equal(bobFailure.error.outbound.status, 400);
+    assert.equal(bobFailure.error.outbound.nonceReservation, "reserved"); assert.equal(bobFailure.error.outbound.dispatchBegan, true);
+
+    const sendFixture = async () => {
+      const root = resolve(tmp.path, `send-rec-${++next}`); await cp(sendSeed.root, root, { recursive: true });
+      const stores = createStores(root); const mailbox = await stores.mailboxes.load("alice");
+      let gets = 0; let posts = 0;
+      const exact = { seq: 1, ts: new Date(0).toISOString(), from: sendManifest.dids.bob, nonce: 1, text: sendManifest.steps[1].text };
+      let view: RoomResponse = { room: mailbox.room, count: 1, first_seq: 1, last_seq: 1, messages: [exact] };
+      let readError: unknown;
+      const transport = { readRoomJson: async (room: string, query?: ReadRoomOptions) => {
+        gets++; assert.equal(room, mailbox.room); assert.deepEqual(query, SEND_READ_QUERY);
+        if (readError) throw readError; return structuredClone(view);
+      }, readRoomText: async (): Promise<string> => { throw new Error("Text GET forbidden"); },
+      sendSignedMessage: async (): Promise<RoomResponse> => { posts++; throw new Error("POST forbidden"); } };
+      const options = { root, passphrases: async (): Promise<Buffer> => { throw new Error("Unlock forbidden"); }, offlineTransport: transport };
+      const recovery = new SendReconciliation(options); const runner = new FirstRehearsal(options);
+      const snapshots = new Map<string, string>();
+      const walk = async (dir: string) => { for (const e of await readdir(dir, { withFileTypes: true })) {
+        const path = resolve(dir, e.name); if (e.isDirectory()) await walk(path); else snapshots.set(path, await readFile(path, "utf8"));
+      } }; await walk(root);
+      const unchanged = async (allowMain = false) => { for (const [path, bytes] of snapshots) {
+        if (!(allowMain && path === runner.path)) assert.equal(await readFile(path, "utf8"), bytes, `Protected test state changed: ${path}`);
+      } };
+      const proposed = await recovery.prepare(2); const id = proposed.authorizationId, hash = proposed.authorizationHash;
+      return { root, stores, mailbox, exact, recovery, runner, id, hash, transport,
+        file: resolve(root, "send-reconciliation", `${id}.json`),
+        authorize: () => recovery.authorize(id, hash), observe: (hooks = {}) => recovery.observe(id, hash, hooks),
+        apply: (hooks = {}) => recovery.apply(id, hash, hooks), unchanged,
+        counts: () => ({ gets, posts }), setView: (v: RoomResponse) => { view = v; }, setError: (e: unknown) => { readError = e; } };
+    };
+
+    await t.test("send reconciliation: exact Step 2 observation -> offline atomic apply; original failed task and Step 1 remain unchanged", async () => {
+      const f = await sendFixture(); await assert.rejects(() => f.observe()); assert.deepEqual(f.counts(), { gets: 0, posts: 0 });
+      await f.authorize(); const observed = await f.observe(); assert.equal(observed.status, "observed"); await f.unchanged();
+      assert.equal((await f.runner.status()).halted, "send-failed");
+      assert.equal((await f.apply()).status, "applied"); await f.unchanged(true);
+      const state = await f.runner.status(); assert.equal(state.nextStep, 2); assert.equal(state.halted, null);
+      assert.equal(state.steps[1]!.status, "sent-reconciled"); assert.equal(state.steps[1]!.seq, 1); assert.equal(state.steps[2]!.status, "planned");
+      assert.equal(state.logicalPostAttempts, 2); assert.equal(state.getAttempts, 1);
+      const before = await readFile(f.runner.path, "utf8"), record = await readFile(f.file, "utf8");
+      assert.equal((await f.apply()).status, "already-applied");
+      assert.equal(await readFile(f.runner.path, "utf8"), before); assert.equal(await readFile(f.file, "utf8"), record);
+      await assert.rejects(() => f.observe()); await assert.rejects(() => f.authorize());
+      assert.deepEqual(f.counts(), { gets: 1, posts: 0 });
+      const output = JSON.stringify([observed, state]) + record;
+      assert.equal(output.includes(f.mailbox.room), false); assert.equal(output.includes(f.exact.text), false);
+      for (const bytes of identityBytes.values()) assert.equal(output.includes(JSON.parse(bytes).encryptedPrivateKey.ciphertext), false);
+    });
+
+    const viewFaults: Record<string, (f: Awaited<ReturnType<typeof sendFixture>>) => RoomResponse> = {
+      wrongSender: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, from: sendManifest.dids.alice }] }),
+      wrongMailbox: f => ({ room: "different", count: 1, first_seq: 1, last_seq: 1, messages: [f.exact] }),
+      unverifiedSender: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, nonce: undefined } as unknown as RoomResponse["messages"][number]] }),
+      wrongReceiver: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, text: JSON.stringify({ ...JSON.parse(f.exact.text), to: sendManifest.dids.bob }) }] }),
+      wrongStep: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, text: JSON.stringify({ ...JSON.parse(f.exact.text), step: 4 }) }] }),
+      wrongKind: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, text: JSON.stringify({ ...JSON.parse(f.exact.text), kind: "task" }) }] }),
+      wrongPayload: f => ({ count: 1, first_seq: 1, last_seq: 1, messages: [{ ...f.exact, text: "another Bob message" }] }),
+      empty: () => ({ count: 0, first_seq: null, last_seq: 0, messages: [] }),
+      duplicateMatching: f => ({ count: 2, first_seq: 1, last_seq: 2, messages: [f.exact, { ...f.exact, seq: 2 }] }),
+      unrelatedMessages: f => ({ count: 2, first_seq: 1, last_seq: 2, messages: [{ ...f.exact, text: "unrelated one" }, { ...f.exact, seq: 2, text: "unrelated two" }] }),
+      retentionWindow: () => ({ count: 0, first_seq: 300, last_seq: 500, messages: [] }),
+    };
+    for (const [name, makeView] of Object.entries(viewFaults)) await t.test(`send reconciliation ${name}: no false proof, resend, ACK or second GET`, async () => {
+      const f = await sendFixture(); f.setView(makeView(f)); await f.authorize(); const result = await f.observe();
+      assert.notEqual(result.status, "observed"); await assert.rejects(() => f.apply()); await assert.rejects(() => f.observe());
+      await f.unchanged(); assert.deepEqual(f.counts(), { gets: 1, posts: 0 });
+      assert.equal(JSON.stringify(result).includes("unrelated one"), false);
+      if (result.status === "not-observed") assert.match(result.warning!, /No resend authorized/);
+    });
+    await t.test("send reconciliation can find exact payload among unrelated retained messages without exposing them", async () => {
+      const f = await sendFixture(); f.setView({ count: 2, first_seq: 1, last_seq: 2, messages: [f.exact, { ...f.exact, seq: 2, text: "unrelated secret" }] });
+      await f.authorize(); const result = await f.observe(); assert.equal(result.status, "observed");
+      assert.equal(JSON.stringify(result).includes("unrelated secret"), false); await f.unchanged();
+    });
+    for (const [name, error] of Object.entries({ parse: new SyntaxError("private bytes"), http400: new TransportError("private bytes", 400),
+      http503: new TransportError("private bytes", 503), timeout: Object.assign(new Error("private bytes"), { code: "ETIMEDOUT" }),
+      reset: Object.assign(new Error("private bytes"), { code: "ECONNRESET" }) })) await t.test(`send observation ${name}: durable failure, one GET, no retry`, async () => {
+      const f = await sendFixture(); f.setError(error); await f.authorize(); const result = await f.observe();
+      assert.equal(result.status, "failed"); assert.equal(JSON.stringify(result).includes("private bytes"), false);
+      await assert.rejects(() => f.observe()); await assert.rejects(() => f.apply()); await f.unchanged();
+      assert.deepEqual(f.counts(), { gets: 1, posts: 0 });
+    });
+    for (const name of ["authorization", "actionHash", "state", "cursor", "contact", "payloadHash"] as const) await t.test(`send read authorization binds ${name} before network`, async () => {
+      const f = await sendFixture(); await f.authorize();
+      if (name === "authorization") { await assert.rejects(() => f.recovery.observe(f.id, "0".repeat(64))); }
+      else {
+        if (name === "actionHash") await editJson(f.runner.path, s => { s.steps[1].actionHash = "0".repeat(64); });
+        if (name === "payloadHash") await editJson(f.file, r => { r.spec.payloadHash = "0".repeat(64); });
+        if (name === "state") await editJson(f.runner.path, s => { s.gets = 2; });
+        if (name === "cursor") await f.stores.cursors.advance("alice", f.mailbox.room, 1);
+        if (name === "contact") await editJson(resolve(f.root, "contacts/bob.json"), c => { c.contacts.alice.did = sendManifest.dids.bob; });
+        await assert.rejects(() => f.observe());
+      }
+      assert.deepEqual(f.counts(), { gets: 0, posts: 0 });
+    });
+    for (const boundary of ["get-intent", "observation-validated", "observation-persisted", "apply-intent", "main-applied", "applied"] as SendRecoveryBoundary[]) {
+      await t.test(`send reconciliation crash ${boundary}: durable quarantine or offline completion`, async () => {
+        const f = await sendFixture(); await f.authorize(); const crash = { afterBoundary: (p: SendRecoveryBoundary) => { if (p === boundary) throw new Error("Crash"); } };
+        if (["get-intent", "observation-validated", "observation-persisted"].includes(boundary)) {
+          await assert.rejects(() => f.observe(crash)); await assert.rejects(() => f.observe());
+          if (boundary === "observation-persisted") { await f.apply(); await f.unchanged(true); }
+          else { await assert.rejects(() => f.apply()); await f.unchanged(); }
+        } else { await f.observe(); await assert.rejects(() => f.apply(crash)); await f.apply(); await f.unchanged(true); }
+        assert.deepEqual(f.counts(), { gets: boundary === "get-intent" ? 0 : 1, posts: 0 });
+      });
+    }
+    await t.test("send reconciliation HTTP adapter is injected: exact GET query, redirects disabled, no retries", async () => {
+      const f = await sendFixture(); let calls = 0;
+      const http = new HttpTechnocoreTransport("https://example.test", { readRetries: 0, rateLimitRetries: 0, readRedirect: "error",
+        httpsRequest: () => { throw new Error("POST forbidden"); }, fetch: async (input, init) => {
+          calls++; const url = new URL(input); assert.equal(init?.method, "GET"); assert.equal(init.redirect, "error");
+          assert.equal(url.searchParams.get("since"), "0"); assert.equal(url.searchParams.get("limit"), "200");
+          return Response.json({ count: 1, first_seq: 1, last_seq: 1, messages: [f.exact] });
+        } });
+      await f.authorize(); const rec = new SendReconciliation({ root: f.root, passphrases: passphrases.provider, offlineTransport: http });
+      assert.equal((await rec.observe(f.id, f.hash)).status, "observed"); assert.equal(calls, 1); await f.unchanged();
+    });
+    await t.test("normal receive after send-apply remains explicit and preserves the original failed outbound task", async () => {
+      const f = await sendFixture(); await f.authorize(); await f.observe(); await f.apply();
+      const bobBefore = await readFile(resolve(f.root, "agents/bob/state.json"), "utf8");
+      const runner = new FirstRehearsal({ root: f.root, passphrases: passphrases.provider, offlineTransport: f.transport });
+      await runner.receive(2); assert.equal((await runner.status()).nextStep, 3);
+      assert.equal(await readFile(resolve(f.root, "agents/bob/state.json"), "utf8"), bobBefore);
+      const mainBefore = await readFile(runner.path, "utf8"); assert.equal((await f.apply()).status, "already-applied");
+      assert.equal(await readFile(runner.path, "utf8"), mainBefore);
+    });
+    for (const target of ["observation", "task", "cursor", "state", "contact"] as const) await t.test(`send apply rejects changed ${target} after observation`, async () => {
+      const f = await sendFixture(); await f.authorize(); await f.observe();
+      if (target === "observation") await editJson(f.file, r => { r.observation.match.payloadHash = "0".repeat(64); });
+      if (target === "task") await editJson(resolve(f.root, "agents/bob/state.json"), s => { s.tasks.rehearsal_send_2.attempts = 2; });
+      if (target === "cursor") await f.stores.cursors.advance("alice", f.mailbox.room, 1);
+      if (target === "state") await editJson(f.runner.path, s => { s.gets = 2; });
+      if (target === "contact") await editJson(resolve(f.root, "contacts/bob.json"), c => { c.contacts.alice.did = sendManifest.dids.bob; });
+      const before = await readFile(f.runner.path, "utf8"); await assert.rejects(() => f.apply());
+      assert.equal(await readFile(f.runner.path, "utf8"), before); assert.deepEqual(f.counts(), { gets: 1, posts: 0 });
+    });
+    for (const boundary of ["apply-intent", "main-applied", "applied"] as SendRecoveryBoundary[]) await t.test(`send apply process exit ${boundary} recovers offline`, async () => {
+      const f = await sendFixture(); await f.authorize(); await f.observe();
+      const program = `import {Socket} from 'node:net'; Socket.prototype.connect=()=>{throw new Error('Network forbidden')};
+        globalThis.fetch=()=>{throw new Error('Network forbidden')};
+        const {SendReconciliation}=await import('./dist/src/rehearsal/send-reconciliation.js');
+        const [root,id,hash,boundary]=process.argv.slice(1); const denied=async()=>{throw new Error('IO forbidden')};
+        const rec=new SendReconciliation({root,passphrases:denied,offlineTransport:{readRoomJson:denied,readRoomText:denied,sendSignedMessage:denied}});
+        await rec.apply(id,hash,{afterBoundary:p=>{if(p===boundary)process.exit(75)}});`;
+      const child = spawnSync(process.execPath, ["--input-type=module", "-e", program, f.root, f.id, f.hash, boundary], { encoding: "utf8", timeout: 5000 });
+      assert.equal(child.status, 75); assert.equal(child.stdout + child.stderr, "");
+      await f.apply(); assert.equal((await f.apply()).status, "already-applied"); await f.unchanged(true);
+      assert.deepEqual(f.counts(), { gets: 1, posts: 0 });
+    });
+    await t.test("send reconciliation CLI prepare/authorize/status are local and secret-free", async () => {
+      const root = resolve(tmp.path, `send-cli-${++next}`); await cp(sendSeed.root, root, { recursive: true });
+      const main = resolve(root, "agents/alice/rehearsal/first-room-read-v1.json");
+      await editJson(main, s => { s.mode = "live"; }); // Synthetic metadata only; no network transport invoked.
+      const before = await readFile(main, "utf8");
+      const guard = "import {Socket} from 'node:net'; Socket.prototype.connect=()=>{throw new Error('Network forbidden')};globalThis.fetch=()=>{throw new Error('Network forbidden')};";
+      const env: NodeJS.ProcessEnv = { ...process.env, TECHNOCORE_HOME: root }; delete env.TECHNOCORE_URL;
+      const cli = (...args: string[]) => spawnSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(guard)}`, resolve("dist/src/cli.js"), ...args], { env, encoding: "utf8", timeout: 5000 });
+      const prepare = cli("rehearsal:send-reconcile-prepare", "2"); assert.equal(prepare.status, 0);
+      const p = JSON.parse(prepare.stdout);
+      const auth = cli("rehearsal:send-reconcile-authorize", p.authorizationId, p.authorizationHash); assert.equal(auth.status, 0);
+      const status = cli("rehearsal:send-reconcile-status", p.authorizationId, p.authorizationHash); assert.equal(status.status, 0);
+      assert.equal(JSON.parse(status.stdout).observationAttempts, 0);
+      const earlyApply = cli("rehearsal:send-reconcile-apply", p.authorizationId, p.authorizationHash); assert.equal(earlyApply.status, 1);
+      const output = [prepare, auth, status, earlyApply].map(r => r.stdout + r.stderr).join("");
+      const mailbox = await createStores(root).mailboxes.load("alice"); assert.equal(output.includes(mailbox.room), false);
+      assert.equal(output.includes(sendManifest.steps[1].text), false); assert.equal(await readFile(main, "utf8"), before);
+    });
     assert.equal(network, 0);
     assert.deepEqual((await readdir(resolve(base, "identities"))).sort(), ALIASES.map(n => `${n}.json`).sort());
   } finally {

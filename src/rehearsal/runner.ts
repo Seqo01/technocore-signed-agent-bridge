@@ -23,6 +23,8 @@ import { ALIASES, TEAM, type Alias } from "./setup.js";
 import { validateReceipt } from "./receipt.js";
 import { receiveFailure, type ReadProgress, type ReceiveFailure, type ReceiveStage } from "../receive-diagnostics.js";
 import type { RecoveredReceipt, RecoveryHooks } from "./recovery.js";
+import type { SendRecoveryReceipt } from "./send-reconciliation.js";
+import type { OutboundDiagnostics } from "../send-diagnostics.js";
 
 export const QUESTION = "Assess Technocore room-read reliability and edge behavior, focusing on duplicate delivery, replay handling, retention gaps, room epoch/sequence behavior, and safe agent-side recovery. Produce a concise evidence-backed engineering recommendation.";
 export const GRAPH = Object.freeze([
@@ -42,11 +44,13 @@ export interface AnalysisPacket {
 }
 interface Analysis { packetHash: string; packet: AnalysisPacket; evidence?: TaskEvidence; delegationId?: string }
 interface Step {
-  status: "planned" | "prepared" | "post-intent" | "sent" | "get-intent" | "received" | "acknowledged" | "received-reconciled";
+  status: "planned" | "prepared" | "post-intent" | "sent" | "sent-reconciled" | "get-intent" | "received" | "acknowledged" | "received-reconciled";
   text?: string; taskId?: string; actionId?: string; actionHash?: string; payloadHash?: string;
   seq?: number; inboundTaskId?: string;
   failure?: ReceiveFailure;
   recovery?: RecoveredReceipt;
+  sendRecovery?: SendRecoveryReceipt;
+  sendFailure?: OutboundDiagnostics;
   observation?: { kind: "live-observation" | "deterministic-offline"; firstSeq: number | null; lastSeq: number; seq: number; messageHash: string };
 }
 export interface RehearsalState {
@@ -139,7 +143,7 @@ export class FirstRehearsal {
       if (inspectOnly) return await fn(state);
       if (state.steps.some((step, i) => i < state.index ? !(step.status === "acknowledged" ||
         (i === 0 && step.status === "received-reconciled" && step.recovery?.step === 1)) :
-        i > state.index ? step.status !== "planned" : !["planned", "prepared", "post-intent", "sent", "get-intent", "received"].includes(step.status))) {
+        i > state.index ? step.status !== "planned" : !["planned", "prepared", "post-intent", "sent", "sent-reconciled", "get-intent", "received"].includes(step.status))) {
         return await this.halt(state, "unexpected-step-state");
       }
       if (state.halted) throw new BridgeError("Rehearsal halted; no automatic continuation or retry");
@@ -277,6 +281,7 @@ export class FirstRehearsal {
         await this.assertNoOtherWork(runtime, [step.taskId!]);
         step.status = "post-intent"; state.posts++; await this.saved(state);
         const result = await runtime.runOnce(step.taskId);
+        if (result.task?.error?.outbound) step.sendFailure = result.task.error.outbound;
         if (result.task?.status !== "succeeded") return await this.halt(state, result.task?.status === "ambiguous" ? "ambiguous-send" : "send-failed");
         const seq = Number(result.task.result?.reference?.replace("seq:", ""));
         if (!Number.isSafeInteger(seq) || seq < 1) return await this.halt(state, "unknown-send-receipt");
@@ -292,7 +297,7 @@ export class FirstRehearsal {
   async receive(stepNumber: number) {
     return this.locked(false, async state => {
       const { step, from, to } = this.selected(state);
-      if (stepNumber !== state.index + 1 || !["sent", "received"].includes(step.status)) throw new BridgeError("Exact sent step required for receipt");
+      if (stepNumber !== state.index + 1 || !["sent", "sent-reconciled", "received"].includes(step.status)) throw new BridgeError("Exact sent step required for receipt");
       const mailbox = await this.stores.mailboxes.load(to);
       // Crash after durable receipt and before cursor ack: verify existing persisted data, no second GET.
       if (step.status === "received") {
@@ -454,7 +459,8 @@ export class FirstRehearsal {
       logicalPostAttempts: state.posts, getAttempts: state.gets, budget: { maxPosts: 8, maxGets: 8, automaticRetries: 0 },
       steps: state.steps.map((step, index) => ({ number: index + 1, from: GRAPH[index]![0], to: GRAPH[index]![1],
         status: step.status, actionId: step.actionId, actionHash: step.actionHash, payloadHash: step.payloadHash, seq: step.seq,
-        observation: step.observation, failure: step.failure, recovery: step.recovery })),
+        observation: step.observation, failure: step.failure, recovery: step.recovery,
+        sendFailure: step.sendFailure, sendRecovery: step.sendRecovery })),
       results: Object.fromEntries(Object.entries(state.analyses).map(([alias, value]) => [alias, {
         packetHash: value.packetHash, resultHash: value.evidence?.resultHash, scope: "operator-assisted-supplied-evidence-only" }])) };
   }
@@ -478,5 +484,10 @@ export class FirstRehearsal {
       if (!state.halted) throw new BridgeError("Reconciliation requires a halted rehearsal");
       return operation(structuredClone(state));
     }, true);
+  }
+
+  /** Host-only reconciliation transaction; binding checks and existing rehearsal lock, no runtime or IO. */
+  async withSendRecoverySnapshot<T>(operation: (state: RehearsalState) => Promise<T>): Promise<T> {
+    return this.locked(false, state => operation(structuredClone(state)), true);
   }
 }

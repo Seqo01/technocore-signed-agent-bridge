@@ -1,4 +1,5 @@
 import { BridgeError } from "../errors.js";
+import { cleanOutbound, outboundDiagnostics } from "../send-diagnostics.js";
 import { validateEvidence } from "./evidence.js";
 import {
   atomicCreateJson,
@@ -79,6 +80,9 @@ function validateIdentifier(value: string, label: string): string {
 }
 
 export function safeErrorRecord(error: unknown): SafeErrorRecord {
+  const outbound = outboundDiagnostics(error);
+  if (outbound) return { name: cleanOutbound(outbound).errorClass,
+    messageHash: hashText(error instanceof Error ? error.message : "Outbound failure"), outbound: cleanOutbound(outbound) };
   const name = error instanceof Error && error.name ? error.name : "Error";
   const message = error instanceof Error ? error.message : String(error);
   const code = (error as { code?: unknown } | null)?.code;

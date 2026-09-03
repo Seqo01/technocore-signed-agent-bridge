@@ -276,6 +276,102 @@ task, journal entry, cursor or counter. It also does not undo later explicit ope
 clear a later halt. A mismatched ID/hash or changed receipt fails closed. The main
 `rehearsal:status` exposes the recovery history; the old reconciliation record remains immutable.
 
+## Reconcile an uncertain outbound send (separate exact read approval)
+
+A failed outbound task is not, by itself, proof of non-delivery. The original task, approval,
+error hash, checkpoint history and POST count must remain intact. The send-reconciliation module
+uses the existing graph/bindings, locks, exact-effect approval store and HTTP reader; it never
+uses a signing path. It supports halted `post-intent` sends with one failed/ambiguous task attempt,
+including Step 2 Bob -> Alice after Step 1 has been received/reconciled. It does not repair
+arbitrary task states or enable another POST.
+
+Commands (placeholders must come from the new local proposal, not the original send approval):
+
+```text
+node dist/src/cli.js rehearsal:send-reconcile-prepare 2
+node dist/src/cli.js rehearsal:send-reconcile-authorize <authorization-id> <authorization-hash>
+node dist/src/cli.js rehearsal:send-reconcile-status <authorization-id> <authorization-hash>
+node dist/src/cli.js rehearsal:send-reconcile-observe <authorization-id> <authorization-hash>
+node dist/src/cli.js rehearsal:send-reconcile-apply <authorization-id> <authorization-hash>
+```
+
+Only `observe` may perform network IO, and only when separately invoked by the operator after
+exact read authorization. Live observation also requires the canonical `TECHNOCORE_URL` value.
+Prepare/authorize/status/apply do not unlock a key, run AgentRuntime or construct a live transport.
+Neither `prepare` nor `authorize` grants permission for a POST.
+
+The distinct `technocore.reconcile-send-read` effect binds the rehearsal id/version, step,
+sender/receiver aliases and DIDs, original action id/hash, payload hash, current contact/mailbox
+hash, canonical origin, current receiver cursor, halted manifest hash, original failed task and
+approval hashes, purpose, mode and exact query. Records and separate read approvals live under
+ignored `.technocore/send-reconciliation/`; they are local operational evidence, not public artifacts.
+
+Observation uses exactly one `GET`, `since=0`, `wait=0`, `limit=200`, `format=json`, zero retries
+and redirect policy `error`. It never paginates, polls, ACKs or resets a cursor. The reader bounds
+both waiting for headers and streaming the body (15 seconds each by default), with a 2 MiB byte
+limit. A stopped or failed observation cannot be run again using the same authorization.
+
+It examines the currently retained window. Only an exact payload hash with the expected sender
+DID, signed-lane nonce, receiver/frame bindings, rehearsal, step and kind (`result` for Step 2)
+is positive evidence. A different message from Bob is not proof. Multiple exact matches, wrong
+sender attribution, invalid sequence data or wrong response room fail closed. Unrelated messages
+are neither printed nor retained. As in the existing bridge, signed attribution here relies on
+the server's verified DID/nonce lane over the fixed HTTPS origin; it is not independent signature
+verification of a raw signed receipt.
+
+Durable outcomes are `observed`, `not-observed`, and `failed`. Positive evidence contains only
+validated metadata, payload/observation hashes and observed seq. Negative evidence records the
+bounded query, returned count, first/last seq, retention gap and incomplete-window indicators.
+It never asserts global absence or authorizes a resend. Origin request/commit logs, or separately
+reviewed retention/epoch and complete-window evidence, would be needed before deciding on a fresh
+send. Failed GETs retain only allowlisted diagnostics, never response bodies or capability URLs.
+
+An observation intent and spent read approval precede the GET. A crash before durable observation
+leaves `get-intent` quarantined: the original response cannot be reconstructed and no automatic
+second GET is allowed. If the verified observation is already durable, apply can finish the local
+read-approval confirmation without another GET.
+
+Offline apply accepts only fully validated positive evidence. It rechecks the unchanged original
+task/approval, contact, cursor and halted state, and requires observed seq = current cursor + 1
+with no retention gap. An older already-acknowledged match is therefore not sufficient for this
+apply operation. It persists an apply intent/receipt, atomically installs `sent-reconciled` plus
+seq/evidence and removes only the exact original recoverable halt, then marks the intent applied.
+It preserves the step index, all normal POST/GET counters, original failed task/approval and failure
+history. The reconciliation GET count stays separately recorded as `observationAttempts=1`.
+The metadata explicitly says that the original HTTP success receipt was **not fabricated**.
+
+Crashes after the atomic main write finish only the local marker; before it, the old halt remains.
+Repeated apply returns `already-applied` without duplicating records or undoing later explicit
+receive processing. Normal `rehearsal:receive 2` remains a separate operator action, with all its
+existing strict sequence/retention/intake-before-ACK rules. Apply does not run it or prepare Step 3.
+
+### Outbound failure classification and diagnostics
+
+Previously, complete non-2xx/non-5xx signed responses produced a plain `TransportError`. The
+runtime's outer error handler marked these tasks `failed`; only `AmbiguousSendError` selected
+`ambiguous`. A historical error hash matching the old HTTP 400/text/plain/body-received template
+can identify that classification path, but cannot recover the body or explain the rejection.
+Other pre-dispatch validation/storage errors and runtime persistence/journal errors can also fail
+a task; its status must not be interpreted as a global delivery guarantee.
+
+Complete HTTP 4xx responses now have an explicit refusal error with safe HTTP diagnostics.
+5xx, redirects, interrupted responses, invalid successful responses and generic exceptions after
+entering the signed transport are ambiguous. No generic error after dispatch is treated as proof
+of refusal. Existing explicit 429 retry handling remains bounded; rehearsal sets that bound to zero.
+This change does not reclassify or rewrite any historical task.
+
+Task errors and journal errors can now retain allowlisted stage, error class, HTTP status,
+headers/body/parse progress, timeout, safe cause code, nonce-reservation progress and dispatch flag.
+`dispatchBegan` means the bridge entered the transport, not proof that the peer received bytes.
+`nonceReservation=attempted` deliberately does not claim whether a failing persistence operation
+consumed a nonce. Unknown fields are omitted; no URL, signature, private key, passphrase or raw
+body is copied into these diagnostics.
+
+All reconciliation tests use generated temporary identities/state and injected transports.
+They cover matching/negative/conflicting observations, authorization/state/cursor/contact binding,
+crash boundaries (including process exits), offline idempotent apply, preservation of failed-send
+history, explicit later receive, CLI privacy and zero live network activity.
+
 ## Security and tests
 
 Peer text is untrusted; only exact planned content is accepted. It never becomes a command,

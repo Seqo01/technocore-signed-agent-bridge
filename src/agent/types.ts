@@ -45,6 +45,7 @@ export interface SafeErrorRecord {
   name: string;
   code?: string;
   messageHash: string;
+  outbound?: import("../send-diagnostics.js").OutboundDiagnostics;
 }
 
 export interface AgentTaskResult {

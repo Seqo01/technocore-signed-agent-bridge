@@ -4,6 +4,7 @@ import { IdentityStore } from "./identity.js";
 import { MailboxStore } from "./mailboxes.js";
 import { NonceStore } from "./nonce-store.js";
 import { AmbiguousSendError, ProtocolError } from "./errors.js";
+import { attachOutbound, SignedPostRejectedError, type OutboundDiagnostics } from "./send-diagnostics.js";
 import { ActionApprovalStore, ApprovalRequiredError, type ActionApproval, type SignedActionEffect } from "./agent/approvals.js";
 import { hashValue } from "./agent/util.js";
 import { roomClasses } from "./names.js";
@@ -101,23 +102,34 @@ export class SignedAgentBridge {
   private async sendSigned(identity: UnlockedIdentity, room: string, text: string,
     effect: SignedActionEffect, actionId?: string): Promise<RoomResponse> {
     // Shared execution boundary for ALL bridge signing paths. No approval, no nonce, no IO.
-    const approval = await this.stores.approvals.consume(effect, actionId);
+    const progress: OutboundDiagnostics = { stage: "approval", nonceReservation: "not-started", dispatchBegan: false,
+      headersReceived: false, bodyStarted: false, responseParsed: false, timedOut: false, errorClass: "Error" };
+    let approval: ActionApproval | undefined;
     try {
+      approval = await this.stores.approvals.consume(effect, actionId);
+      progress.stage = "nonce-reservation"; progress.nonceReservation = "attempted";
       const nonce = await this.stores.nonces.reserve(identity.did, room);
+      progress.nonceReservation = "reserved"; progress.stage = "signing";
       const signed = signMessage(identity, room, nonce, text);
+      // Entering a transport can have effects before its promise rejects; never infer non-delivery from a generic error.
+      progress.stage = "dispatch"; progress.dispatchBegan = true;
       const response = await this.transport.sendSignedMessage(room, {
         did: signed.did, sig: signed.signature, nonce: signed.nonce, text: signed.sanitizedText,
       });
+      progress.stage = "local-confirmation"; progress.responseParsed = true; progress.headersReceived = true;
       try {
         await this.stores.approvals.finish(identity.name, approval.actionId, "confirmed");
-      } catch {
-        throw new AmbiguousSendError("Signed send completed but local confirmation failed; approval remains spent");
+      } catch (error) {
+        throw new AmbiguousSendError("Signed send completed but local confirmation failed; approval remains spent", undefined, { cause: error });
       }
       return response;
     } catch (error) {
-      await this.stores.approvals.finish(identity.name, approval.actionId,
-        error instanceof AmbiguousSendError ? "ambiguous" : "failed").catch(() => undefined);
-      throw error;
+      const classified = progress.dispatchBegan && !(error instanceof AmbiguousSendError) && !(error instanceof SignedPostRejectedError)
+        ? new AmbiguousSendError("Outbound result requires reconciliation; no automatic retry", undefined, { cause: error }) : error;
+      const failure = attachOutbound(classified, progress);
+      if (approval) await this.stores.approvals.finish(identity.name, approval.actionId,
+        classified instanceof AmbiguousSendError ? "ambiguous" : "failed").catch(() => undefined);
+      throw failure;
     }
   }
 

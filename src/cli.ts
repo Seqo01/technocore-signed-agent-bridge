@@ -17,6 +17,7 @@ import { resolve } from "node:path";
 import { FirstRehearsal, type AnalysisPacket } from "./rehearsal/runner.js";
 import { ALIASES, type Alias } from "./rehearsal/setup.js";
 import { FirstReceiptReconciliation } from "./rehearsal/reconciliation.js";
+import { SendReconciliation } from "./rehearsal/send-reconciliation.js";
 
 function usage(): never {
   throw new BridgeError(
@@ -28,6 +29,8 @@ function usage(): never {
     "rehearsal:reconcile-prepare | rehearsal:reconcile-status | " +
     "rehearsal:reconcile-authorize <id> <hash> | rehearsal:reconcile-observe <id> <hash> | rehearsal:reconcile-complete <id> <hash> | " +
     "rehearsal:reconcile-apply <authorization-id> <authorization-hash> | " +
+    "rehearsal:send-reconcile-prepare <step> | rehearsal:send-reconcile-authorize <id> <hash> | " +
+    "rehearsal:send-reconcile-observe <id> <hash> | rehearsal:send-reconcile-apply <id> <hash> | rehearsal:send-reconcile-status <id> <hash> | " +
     "action:prepare-contact <sender> <contact-id> <text> | action:prepare-public <sender> <room> <text> | " +
     "action:approve <alias> <action-id> <action-hash> | " +
     "mailbox:create <owner> | " +
@@ -62,6 +65,20 @@ async function main(): Promise<void> {
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
+    case "rehearsal:send-reconcile-prepare":
+    case "rehearsal:send-reconcile-authorize":
+    case "rehearsal:send-reconcile-observe":
+    case "rehearsal:send-reconcile-apply":
+    case "rehearsal:send-reconcile-status": {
+      const recovery = new SendReconciliation({ root: _paths.root, passphrases: hiddenPassphraseProvider });
+      const prepare = command === "rehearsal:send-reconcile-prepare";
+      if (args.length !== (prepare ? 1 : 2) || (prepare && !/^[1-8]$/u.test(args[0]!))) usage();
+      const result = prepare ? await recovery.prepare(Number(args[0])) :
+        command === "rehearsal:send-reconcile-authorize" ? await recovery.authorize(args[0]!, args[1]!) :
+        command === "rehearsal:send-reconcile-observe" ? await recovery.observe(args[0]!, args[1]!) :
+        command === "rehearsal:send-reconcile-apply" ? await recovery.apply(args[0]!, args[1]!) : await recovery.status(args[0]!, args[1]!);
+      console.log(JSON.stringify(result, null, 2)); return;
+    }
     case "rehearsal:reconcile-apply": {
       if (args.length !== 2) usage();
       const runner = new FirstRehearsal({ root: _paths.root, passphrases: hiddenPassphraseProvider });

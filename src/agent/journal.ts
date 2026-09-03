@@ -1,6 +1,7 @@
 import { chmod, open, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { BridgeError } from "../errors.js";
+import { cleanOutbound } from "../send-diagnostics.js";
 import { ensurePrivateDirectory, withFileLock } from "../fs-safe.js";
 import { assertTechnocoreName, roomClasses } from "../names.js";
 import { didToPublicKeyBytes } from "../protocol.js";
@@ -61,6 +62,7 @@ function validateSafeError(error: SafeErrorRecord): SafeErrorRecord {
     name: validateSafeId(error.name, "error name"),
     ...(error.code ? { code: validateSafeId(error.code, "error code") } : {}),
     messageHash: error.messageHash,
+    ...(error.outbound ? { outbound: cleanOutbound(error.outbound) } : {}),
   };
 }
 

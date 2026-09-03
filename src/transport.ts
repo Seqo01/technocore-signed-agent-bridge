@@ -9,6 +9,7 @@ import {
 } from "./errors.js";
 import { assertTechnocoreName } from "./names.js";
 import { redactSecrets } from "./redact.js";
+import { SignedPostRejectedError } from "./send-diagnostics.js";
 import type { ReadProgress } from "./receive-diagnostics.js";
 import type {
   ReadRoomOptions,
@@ -256,7 +257,7 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
         await delay(retryAfterMilliseconds(response.retryAfter, this.maxRetryDelayMs));
         continue;
       }
-      if (response.status >= 500) {
+      if (response.status < 200 || response.status >= 500 || (response.status >= 300 && response.status < 400)) {
         throw ambiguousSend({
           stage: "response-status",
           headersReceived: true,
@@ -268,10 +269,8 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
         });
       }
       if (response.status < 200 || response.status >= 300) {
-        throw new TransportError(
-          `Technocore rejected signed send; status=${response.status}; contentType=${response.contentType}; bodyReceived=${response.bodyStarted}; endpoint=${endpoint}`,
-          response.status,
-        );
+        throw new SignedPostRejectedError({ stage: "response-status", headersReceived: true, timedOut: false,
+          endpoint, status: response.status, contentType: response.contentType, bodyStarted: response.bodyStarted });
       }
       if (response.contentType !== "application/json") {
         throw ambiguousSend({
@@ -477,11 +476,30 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
     }
   }
 
-  private async readBody(response: Response, room: string): Promise<string> {
-    const body = await response.text();
-    if (Buffer.byteLength(body, "utf8") > this.maxResponseBytes) {
-      throw new TransportError(redactSecrets("Technocore response exceeded the local size limit", [room]), response.status);
+  private async readBody(response: Response, _room: string): Promise<string> {
+    if (!response.body) return "";
+    const reader = response.body.getReader();
+    let timer: NodeJS.Timeout | undefined;
+    const consume = async () => {
+      const chunks: Buffer[] = []; let size = 0;
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        size += value.byteLength;
+        if (size > this.maxResponseBytes) throw new TransportError("Technocore response exceeded the local size limit", response.status);
+        chunks.push(Buffer.from(value));
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    };
+    try {
+      return await Promise.race([consume(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          this.onReadProgress?.({ stage: "response-parse", headersReceived: true, status: response.status, timedOut: true });
+          reject(new TransportError("Technocore response body timed out", response.status));
+        }, this.timeoutMs);
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      void reader.cancel().catch(() => undefined);
     }
-    return body;
   }
 }
