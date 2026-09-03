@@ -27,6 +27,7 @@ function usage(): never {
     "rehearsal:receive <step> | rehearsal:work <alias> | rehearsal:finalize | " +
     "rehearsal:reconcile-prepare | rehearsal:reconcile-status | " +
     "rehearsal:reconcile-authorize <id> <hash> | rehearsal:reconcile-observe <id> <hash> | rehearsal:reconcile-complete <id> <hash> | " +
+    "rehearsal:reconcile-apply <authorization-id> <authorization-hash> | " +
     "action:prepare-contact <sender> <contact-id> <text> | action:prepare-public <sender> <room> <text> | " +
     "action:approve <alias> <action-id> <action-hash> | " +
     "mailbox:create <owner> | " +
@@ -61,6 +62,12 @@ async function main(): Promise<void> {
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
+    case "rehearsal:reconcile-apply": {
+      if (args.length !== 2) usage();
+      const runner = new FirstRehearsal({ root: _paths.root, passphrases: hiddenPassphraseProvider });
+      console.log(JSON.stringify(await runner.applyReconciliation(args[0]!, args[1]!), null, 2));
+      return;
+    }
     case "rehearsal:reconcile-prepare":
     case "rehearsal:reconcile-status":
     case "rehearsal:reconcile-authorize":

@@ -22,6 +22,7 @@ import { assertNoSecretLikeOutput } from "../workloads/types.js";
 import { ALIASES, TEAM, type Alias } from "./setup.js";
 import { validateReceipt } from "./receipt.js";
 import { receiveFailure, type ReadProgress, type ReceiveFailure, type ReceiveStage } from "../receive-diagnostics.js";
+import type { RecoveredReceipt, RecoveryHooks } from "./recovery.js";
 
 export const QUESTION = "Assess Technocore room-read reliability and edge behavior, focusing on duplicate delivery, replay handling, retention gaps, room epoch/sequence behavior, and safe agent-side recovery. Produce a concise evidence-backed engineering recommendation.";
 export const GRAPH = Object.freeze([
@@ -41,10 +42,11 @@ export interface AnalysisPacket {
 }
 interface Analysis { packetHash: string; packet: AnalysisPacket; evidence?: TaskEvidence; delegationId?: string }
 interface Step {
-  status: "planned" | "prepared" | "post-intent" | "sent" | "get-intent" | "received" | "acknowledged";
+  status: "planned" | "prepared" | "post-intent" | "sent" | "get-intent" | "received" | "acknowledged" | "received-reconciled";
   text?: string; taskId?: string; actionId?: string; actionHash?: string; payloadHash?: string;
   seq?: number; inboundTaskId?: string;
   failure?: ReceiveFailure;
+  recovery?: RecoveredReceipt;
   observation?: { kind: "live-observation" | "deterministic-offline"; firstSeq: number | null; lastSeq: number; seq: number; messageHash: string };
 }
 export interface RehearsalState {
@@ -135,7 +137,8 @@ export class FirstRehearsal {
         throw new BridgeError("Rehearsal state or destination changed; stop and reconcile");
       }
       if (inspectOnly) return await fn(state);
-      if (state.steps.some((step, i) => i < state.index ? step.status !== "acknowledged" :
+      if (state.steps.some((step, i) => i < state.index ? !(step.status === "acknowledged" ||
+        (i === 0 && step.status === "received-reconciled" && step.recovery?.step === 1)) :
         i > state.index ? step.status !== "planned" : !["planned", "prepared", "post-intent", "sent", "get-intent", "received"].includes(step.status))) {
         return await this.halt(state, "unexpected-step-state");
       }
@@ -391,6 +394,16 @@ export class FirstRehearsal {
       const runtimes = new Map<Alias, AgentRuntime>();
       try {
         for (const name of ALIASES) runtimes.set(name, await this.runtime(name, state, undefined, provider));
+        // Only a subsequent explicit work invocation may process this retained inbound item.
+        const recovered = state.index === 1 && alias === "bob" ? state.steps[0]!.recovery : undefined;
+        if (recovered) {
+          const bob = runtimes.get("bob")!;
+          const inbound = (await bob.state.load()).tasks[recovered.inboundTaskId];
+          if (!inbound || inbound.type !== "inbound.message" || hashValue(inbound.payload) !== recovered.inboundPayloadHash) {
+            throw new BridgeError("Recovered inbound task changed");
+          }
+          await this.runLocal(bob, inbound);
+        }
         const alice = runtimes.get("alice")!;
         const parent = await alice.enqueueTask({ id: PARENT, idempotencyKey: PARENT, type: "workload.coordination",
           payload: { question: QUESTION, phase: "decomposition" }, context: { mode: "explicit-only", evidence: [] } });
@@ -441,11 +454,23 @@ export class FirstRehearsal {
       logicalPostAttempts: state.posts, getAttempts: state.gets, budget: { maxPosts: 8, maxGets: 8, automaticRetries: 0 },
       steps: state.steps.map((step, index) => ({ number: index + 1, from: GRAPH[index]![0], to: GRAPH[index]![1],
         status: step.status, actionId: step.actionId, actionHash: step.actionHash, payloadHash: step.payloadHash, seq: step.seq,
-        observation: step.observation, failure: step.failure })),
+        observation: step.observation, failure: step.failure, recovery: step.recovery })),
       results: Object.fromEntries(Object.entries(state.analyses).map(([alias, value]) => [alias, {
         packetHash: value.packetHash, resultHash: value.evidence?.resultHash, scope: "operator-assisted-supplied-evidence-only" }])) };
   }
   async status() { return this.locked(false, async state => this.summary(state), true); }
+
+  async applyReconciliation(id: string, hash: string, hooks: RecoveryHooks = {}) {
+    const { applyReceiptRecovery, reconciliationFile } = await import("./recovery.js");
+    let lock: AgentRuntimeLock | undefined;
+    try {
+      // Same lock order as observe/complete; no runtime startup, transport or passphrase request.
+      lock = await AgentRuntimeLock.acquire(`${reconciliationFile(this.stores.paths.root)}.lock`);
+      return await this.locked(false, state => applyReceiptRecovery(this.stores.paths.root, this.path, state, id, hash, hooks), true);
+    } catch {
+      throw new BridgeError("Offline recovery stopped; evidence or transition requires review; no network or cursor change");
+    } finally { await lock?.release(); }
+  }
 
   /** Host-only read of a quarantined rehearsal under its existing lock. Never saves or advances it. */
   async withHaltedSnapshot<T>(operation: (state: RehearsalState) => Promise<T>): Promise<T> {

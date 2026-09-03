@@ -58,6 +58,8 @@ interface RecordV1 {
   failure?: ReceiveFailure;
 }
 
+export type ReconciliationRecord = RecordV1;
+
 const denied = async (): Promise<never> => { throw new BridgeError("Operation outside reconciliation policy"); };
 
 /** A single exact-authorized observation; does not reset cursors or advance/unhalt the rehearsal. */

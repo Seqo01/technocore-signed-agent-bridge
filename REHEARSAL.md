@@ -209,7 +209,72 @@ hash, revalidates the receipt, and reuses the same task/journal IDs. After a che
 also checks durable evidence before local completion. If the process died before retention,
 there is no local result to recover; neither command retries. Stop for operator review instead
 of deleting state, resetting counters or issuing a new grant. The original halted rehearsal
-remains unchanged in every case; a future continuation policy is outside this change.
+remains unchanged by these observation/completion commands. Explicit offline application is
+described below.
+
+## Apply an already-complete first receipt (offline, explicit operator action)
+
+`reconcile-observe` and `reconcile-complete` still never unhalt or advance the rehearsal.
+A separate command can bind their already-durable result into the main state machine:
+
+```text
+node dist/src/cli.js rehearsal:reconcile-apply <authorization-id> <authorization-hash>
+```
+
+This command is entirely offline. It does not instantiate a transport, unlock an identity,
+start AgentRuntime, run a workload, prepare an action, sign, reserve a nonce, or write a cursor.
+Do not run it during implementation/testing against real state. Only temporary generated
+fixtures are used in the regression suite, including synthetic live-shaped metadata.
+
+The first application requires precisely this condition: live-mode Step 1 Alice -> Bob is
+`get-intent`, sent seq is 1, Bob's cursor is 1, and the original halt is
+`receipt-validation-or-persistence-failed`. POST attempts and normal GET attempts must each
+remain 1. All other steps must still be planned, with no analysis or conflicting receipt.
+The preflight-only halt with zero GET attempts is deliberately not this recovery case.
+
+Before any main-state change, apply checks:
+
+- Complete reconciliation, exactly one observation, `live-observation` kind and unchanged cursor.
+- Exact authorization ID/hash with a confirmed separate read-approval record; matching original
+  manifest hash, Bob DID, Alice DID, contact/mailbox binding and bounded query parameters.
+- Checkpoint seq/step/payload hash and the retained observation hash, with the same frame/DID
+  validation as receipt processing.
+- The expected idempotent inbound task in Bob's state, its full payload hash, and exactly one
+  matching `inbound-persisted` journal event (including owner DID, task ID and room hash).
+- Original successful Alice send task and confirmed outbound approval.
+
+The reconciliation, rehearsal and Alice/Bob runtime locks serialize the transition. A private
+local transition record lives next to the main manifest as
+`first-room-read-v1.json.recovery.json`; it contains only safe references/hashes and audit metadata.
+The reconciliation checkpoint and authorization, inbound task, journal, identities and nonce
+store remain untouched. Invalid evidence fails closed with a fixed, secret-free error.
+
+Durable boundaries are:
+
+1. Validate preconditions, then persist `recovery-intent` with a candidate receipt and stable timestamp.
+2. Revalidate evidence and persist `receipt-verified`.
+3. Revalidate again and atomically replace the main manifest: Step 1 becomes `received-reconciled`,
+   its recovery references are bound, index becomes 1 (`nextStep=2`), and only the original halt
+   is removed. Receipt installation, index update and halt removal are one atomic write.
+4. Mark the transition `applied`.
+
+The enclosing transition phase is authoritative: a candidate receipt in `recovery-intent` does
+not mean recovery has been applied. A crash before the main replacement leaves the original
+halt intact. A crash after it leaves a complete recovered Step 1; restarting verifies the same
+durable evidence and finishes the local marker without another GET. Missing or changed evidence
+stops recovery rather than resetting anything. The main manifest preserves any original failure
+diagnostics and explicitly records the sequence: original receive failed, reconciliation
+observation completed, offline recovery applied. It never relabels the original receive as normal success.
+
+Step 2 remains planned, unprepared and unsent. Bob's inbound task remains as it was. Only a later
+explicit `rehearsal:work bob` invocation may process that exact bound inbound task through the
+existing runtime before running operator-supplied analysis. Reply preparation and exact outbound
+approval remain separate actions.
+
+Repeating apply with the same ID/hash returns `already-applied` without writing another receipt,
+task, journal entry, cursor or counter. It also does not undo later explicit operator work or
+clear a later halt. A mismatched ID/hash or changed receipt fails closed. The main
+`rehearsal:status` exposes the recovery history; the old reconciliation record remains immutable.
 
 ## Security and tests
 

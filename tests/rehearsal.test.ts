@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, readdir, stat, utimes } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, stat, utimes, unlink } from "node:fs/promises";
 import { Socket } from "node:net";
 import { resolve } from "node:path";
 import { test } from "node:test";
@@ -12,6 +12,8 @@ import { AgentStateStore } from "../src/agent/state-store.js";
 import { ActivityJournal } from "../src/agent/journal.js";
 import { ActionApprovalStore } from "../src/agent/approvals.js";
 import { CursorStore } from "../src/cursors.js";
+import { hashValue } from "../src/agent/util.js";
+import type { RecoveryBoundary } from "../src/rehearsal/recovery.js";
 import { FirstReceiptReconciliation, RECONCILIATION_QUERY } from "../src/rehearsal/reconciliation.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
 import { AmbiguousSendError, TransportError } from "../src/errors.js";
@@ -514,6 +516,183 @@ test("controlled rehearsal: fixed graph, exact approval, durable recovery and no
       assert.equal(output.includes(manifest.steps[0].text), false);
       assert.equal(output.includes(passphrases.passphrase.toString("base64url")), false);
       assert.equal(await readFile(f.runner.path, "utf8"), before); await assertCursor(f);
+    });
+
+    // Synthetic live-SHAPE fixture from generated temporary data, not evidence of a real live observation.
+    const recoverySeed = await staleFixture();
+    const seedApproval = await grantRead(recoverySeed);
+    await recoverySeed.reconciliation.observe(seedApproval.authorizationId, seedApproval.authorizationHash);
+    const seedManifest = JSON.parse(await readFile(recoverySeed.runner.path, "utf8"));
+    seedManifest.mode = "live";
+    await atomicWriteJson(recoverySeed.runner.path, seedManifest);
+    const seedRecord = JSON.parse(await readFile(recoverySeed.reconciliation.path, "utf8"));
+    seedRecord.spec.mode = "live"; seedRecord.spec.originalStateHash = hashValue(seedManifest); seedRecord.checkpoint.kind = "live-observation";
+    const effect = { agentAlias: "bob", agentDid: seedRecord.spec.agentDid, type: seedRecord.spec.type,
+      destinationHash: seedRecord.spec.mailboxContactHash, payloadHash: hashValue(seedRecord.spec) };
+    seedRecord.actionHash = hashValue({ actionId: seedRecord.actionId, ...effect });
+    seedRecord.checkpoint.authorizationHash = seedRecord.actionHash;
+    await atomicWriteJson(recoverySeed.reconciliation.path, seedRecord);
+    await atomicWriteJson(resolve(recoverySeed.root, "reconciliation-approvals/bob", `${seedRecord.actionId}.json`),
+      { version: 1, ...effect, actionId: seedRecord.actionId, actionHash: seedRecord.actionHash, status: "confirmed" });
+
+    const recoveryFixture = async () => {
+      const root = resolve(tmp.path, `apply-${++next}`); await cp(recoverySeed.root, root, { recursive: true });
+      const runner = new FirstRehearsal({ root, passphrases: async () => { throw new Error("Recovery must never unlock"); } });
+      const recPath = resolve(root, "agents/bob/reconciliation/first-room-read-v1-step-1.json");
+      const transitionPath = `${runner.path}.recovery.json`;
+      const files = ["cursors/bob.json", "nonces.json", "agents/bob/state.json", "agents/bob/journal.jsonl",
+        "agents/alice/state.json", "agents/alice/journal.jsonl", ...ALIASES.map(alias => `identities/${alias}.json`),
+        "agents/bob/reconciliation/first-room-read-v1-step-1.json", `reconciliation-approvals/bob/${seedRecord.actionId}.json`];
+      const snapshot = new Map(await Promise.all(files.map(async file => [file, await readFile(resolve(root, file), "utf8")] as const)));
+      const unchanged = async () => { for (const [file, content] of snapshot) assert.equal(await readFile(resolve(root, file), "utf8"), content, `Changed ${file}`); };
+      return { root, runner, recPath, transitionPath, snapshot, unchanged, id: seedRecord.actionId as string, hash: seedRecord.actionHash as string,
+        apply: (hooks = {}) => runner.applyReconciliation(seedRecord.actionId, seedRecord.actionHash, hooks) };
+    };
+    const editJson = async (file: string, mutate: (value: any) => void) => { // JSON fault injection, generated fixtures only.
+      const value = JSON.parse(await readFile(file, "utf8")); mutate(value); await atomicWriteJson(file, value);
+    };
+
+    await t.test("offline apply consumes the exact live-state shape without network/unlock/work/ACK; keeps counters and history", async () => {
+      const f = await recoveryFixture();
+      const result = await f.apply();
+      assert.equal(result.status, "applied"); assert.equal(result.nextStep, 2); assert.equal(result.step2, "planned");
+      assert.equal(result.logicalPostAttempts, 1); assert.equal(result.getAttempts, 1); assert.equal(result.observationAttempts, 1);
+      assert.equal(result.networkRequests, 0); assert.equal(result.cursorMutation, "unnecessary");
+      const status = await f.runner.status();
+      assert.equal(status.halted, null); assert.equal(status.nextStep, 2); assert.equal(status.steps[0]!.status, "received-reconciled");
+      assert.equal(status.steps[1]!.status, "planned"); assert.equal(status.steps[1]!.actionId, undefined);
+      assert.equal(status.steps[0]!.recovery?.originalReceive.halted, "receipt-validation-or-persistence-failed");
+      assert.equal(status.steps[0]!.recovery?.reconciliation.status, "complete");
+      assert.equal(status.steps[0]!.recovery?.outcome, "applied");
+      assert.deepEqual(status.results, {}); await f.unchanged();
+      assert.equal((await stat(resolve(f.root, "cursors/bob.json"))).mtime.toISOString(), "2020-01-01T00:00:00.000Z");
+      const original = await readFile(f.runner.path, "utf8"), recovery = await readFile(f.transitionPath, "utf8");
+      const repeated = await new FirstRehearsal({ root: f.root, passphrases: async () => { throw new Error("No unlock"); } }).applyReconciliation(f.id, f.hash);
+      assert.equal(repeated.status, "already-applied"); assert.equal(repeated.nextStep, 2);
+      assert.equal(await readFile(f.runner.path, "utf8"), original); assert.equal(await readFile(f.transitionPath, "utf8"), recovery);
+      await f.unchanged(); assert.equal(network, 0);
+    });
+
+    const recoveryFaults: Record<string, (f: Awaited<ReturnType<typeof recoveryFixture>>) => Promise<void>> = {
+      observationHash: f => editJson(f.recPath, r => { r.checkpoint.observationHash = "0".repeat(64); }),
+      authorizationHash: f => editJson(f.recPath, r => { r.checkpoint.authorizationHash = "0".repeat(64); }),
+      payloadHash: f => editJson(f.recPath, r => { r.checkpoint.payloadHash = "0".repeat(64); }),
+      seq: f => editJson(f.recPath, r => { r.checkpoint.seq = 2; }),
+      senderDid: f => editJson(f.recPath, r => { r.spec.expectedSenderDid = r.spec.agentDid; }),
+      receiverDid: f => editJson(f.recPath, r => { r.spec.agentDid = r.spec.expectedSenderDid; }),
+      missingTask: f => editJson(resolve(f.root, "agents/bob/state.json"), s => { delete s.tasks[seedRecord.checkpoint.inboundTaskId]; s.queue = []; }),
+      changedTaskPayload: f => editJson(resolve(f.root, "agents/bob/state.json"), s => { s.tasks[seedRecord.checkpoint.inboundTaskId].payload.text = "changed"; }),
+      wrongInboundPayloadHash: f => editJson(f.recPath, r => { r.checkpoint.inboundPayloadHash = "0".repeat(64); }),
+      missingJournal: f => unlink(resolve(f.root, "agents/bob/journal.jsonl")),
+      wrongJournalEvidence: async f => {
+        const file = resolve(f.root, "agents/bob/journal.jsonl");
+        const entry = JSON.parse((await readFile(file, "utf8")).trim()); entry.resultHash = "0".repeat(64);
+        const { atomicWriteFile } = await import("../src/fs-safe.js"); await atomicWriteFile(file, JSON.stringify(entry) + "\n");
+      },
+      conflictingReceipt: f => editJson(f.runner.path, s => { s.steps[0].inboundTaskId = "inbound_conflict"; }),
+      conflictingObservation: f => editJson(f.runner.path, s => { s.steps[0].observation = { seq: 2 }; }),
+      wrongHalt: f => editJson(f.runner.path, s => { s.halted = "ambiguous-send"; }),
+      incompleteReconciliation: f => editJson(f.recPath, r => { r.status = "checkpoint"; }),
+      extraObservation: f => editJson(f.recPath, r => { r.attempts = 2; }),
+      offlineObservation: f => editJson(f.recPath, r => { r.checkpoint.kind = "deterministic-offline"; }),
+      wrongStep: f => editJson(f.recPath, r => { r.checkpoint.step = 2; }),
+      wrongNextStep: f => editJson(f.runner.path, s => { s.index = 1; }),
+      extraPost: f => editJson(f.runner.path, s => { s.posts = 2; }),
+      extraGet: f => editJson(f.runner.path, s => { s.gets = 2; }),
+      changedCursor: async f => { await createStores(f.root).cursors.advance("bob", recoverySeed.mailbox.room, 2); },
+      unconfirmedAuthority: f => editJson(resolve(f.root, "reconciliation-approvals/bob", `${f.id}.json`), r => { r.status = "approved"; }),
+      changedRetainedBody: f => editJson(f.recPath, r => { r.retained.peek.messages[0].text = "changed"; }),
+    };
+    for (const [label, mutate] of Object.entries(recoveryFaults)) await t.test(`offline apply rejects ${label} without changing main/cursor/nonce or creating recovery intent`, async () => {
+      const f = await recoveryFixture(); await mutate(f);
+      const before = await readFile(f.runner.path, "utf8");
+      const cursor = await readFile(resolve(f.root, "cursors/bob.json"), "utf8");
+      const nonce = await readFile(resolve(f.root, "nonces.json"), "utf8");
+      await assert.rejects(() => f.apply());
+      assert.equal(await readFile(f.runner.path, "utf8"), before);
+      assert.equal(await readFile(resolve(f.root, "cursors/bob.json"), "utf8"), cursor);
+      assert.equal(await readFile(resolve(f.root, "nonces.json"), "utf8"), nonce);
+      await assert.rejects(() => readFile(f.transitionPath), { code: "ENOENT" }); assert.equal(network, 0);
+    });
+
+    for (const boundary of ["recovery-intent", "receipt-verified", "main-applied", "applied"] as RecoveryBoundary[]) {
+      await t.test(`offline recovery crash after ${boundary}: restart finishes from local evidence, never duplicates or advances twice`, async () => {
+        const f = await recoveryFixture();
+        const before = await readFile(f.runner.path, "utf8");
+        await assert.rejects(() => f.apply({ afterPersist: (phase: RecoveryBoundary) => {
+          if (phase === boundary) throw new Error("Synthetic crash");
+        } }));
+        if (boundary === "recovery-intent" || boundary === "receipt-verified") {
+          assert.equal(await readFile(f.runner.path, "utf8"), before);
+        } else assert.equal((await f.runner.status()).steps[0]!.status, "received-reconciled");
+        const restarted = new FirstRehearsal({ root: f.root, passphrases: async () => { throw new Error("No recovery unlock"); } });
+        await restarted.applyReconciliation(f.id, f.hash);
+        const status = await restarted.status(); assert.equal(status.nextStep, 2); assert.equal(status.halted, null);
+        assert.equal(status.steps[1]!.status, "planned"); assert.equal(status.getAttempts, 1); assert.equal(status.logicalPostAttempts, 1);
+        assert.equal((await restarted.applyReconciliation(f.id, f.hash)).status, "already-applied");
+        await f.unchanged(); assert.equal(network, 0);
+      });
+    }
+
+    await t.test("changed evidence after recovery-intent remains safely halted and requires no GET", async () => {
+      const f = await recoveryFixture(); const before = await readFile(f.runner.path, "utf8");
+      await assert.rejects(() => f.apply({ afterPersist: (phase: RecoveryBoundary) => {
+        if (phase === "recovery-intent") throw new Error("Synthetic crash");
+      } }));
+      await editJson(f.recPath, r => { r.checkpoint.observationHash = "a".repeat(64); });
+      await assert.rejects(() => f.apply()); assert.equal(await readFile(f.runner.path, "utf8"), before); assert.equal(network, 0);
+    });
+
+    for (const boundary of ["recovery-intent", "receipt-verified", "main-applied", "applied"] as RecoveryBoundary[]) {
+      await t.test(`process exit after ${boundary}: dead-process locks recover without GET or duplicate receipt`, async () => {
+        const f = await recoveryFixture(); const before = await readFile(f.runner.path, "utf8");
+        const program = `
+          import { Socket } from 'node:net';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          Socket.prototype.connect = () => { throw new Error('Network forbidden'); };
+          globalThis.fetch = () => { throw new Error('Network forbidden'); };
+          const { FirstRehearsal } = await import(pathToFileURL(resolve('dist/src/rehearsal/runner.js')).href);
+          const [root, id, hash, boundary] = process.argv.slice(1);
+          const runner = new FirstRehearsal({ root, passphrases: async () => { throw new Error('Unlock forbidden'); } });
+          await runner.applyReconciliation(id, hash, { afterPersist: phase => { if (phase === boundary) process.exit(73); } });
+        `;
+        const child = spawnSync(process.execPath, ["--input-type=module", "-e", program, f.root, f.id, f.hash, boundary],
+          { encoding: "utf8", timeout: 5000 });
+        assert.equal(child.status, 73); assert.equal(child.stdout, ""); assert.equal(child.stderr, "");
+        if (boundary === "recovery-intent" || boundary === "receipt-verified") assert.equal(await readFile(f.runner.path, "utf8"), before);
+        await f.apply(); assert.equal((await f.runner.status()).nextStep, 2);
+        assert.equal((await f.apply()).status, "already-applied"); await f.unchanged();
+      });
+    }
+
+    await t.test("apply does not run Bob; only a later explicit work command processes the bound inbound and enables preparation", async () => {
+      const f = await recoveryFixture(); await f.apply(); await f.unchanged();
+      const runner = new FirstRehearsal({ root: f.root, passphrases: passphrases.provider });
+      await runner.work("bob", analysis("bob"));
+      const prepared = await runner.prepare(); assert.equal(prepared.senderAlias, "bob"); assert.equal(prepared.destinationAlias, "alice");
+      const status = await runner.status(); assert.equal(status.steps[1]!.status, "prepared");
+      assert.equal(status.getAttempts, 1); assert.equal(status.logicalPostAttempts, 1); assert.equal(network, 0);
+      const afterWork = await readFile(runner.path, "utf8");
+      assert.equal((await f.apply()).status, "already-applied");
+      assert.equal(await readFile(runner.path, "utf8"), afterWork);
+    });
+
+    await t.test("reconcile-apply CLI is offline, idempotent and secret-free in success and error output", async () => {
+      const f = await recoveryFixture();
+      const guard = "import {Socket} from 'node:net'; Socket.prototype.connect=()=>{throw new Error('Network forbidden')}; globalThis.fetch=()=>{throw new Error('Network forbidden')};";
+      const env: NodeJS.ProcessEnv = { ...process.env, TECHNOCORE_HOME: f.root }; delete env.TECHNOCORE_URL;
+      const invoke = (id: string, hash: string) => spawnSync(process.execPath,
+        ["--import", `data:text/javascript,${encodeURIComponent(guard)}`, resolve("dist/src/cli.js"), "rehearsal:reconcile-apply", id, hash],
+        { env, encoding: "utf8", timeout: 5000 });
+      const success = invoke(f.id, f.hash), repeated = invoke(f.id, f.hash);
+      assert.equal(success.status, 0); assert.equal(repeated.status, 0);
+      assert.equal(JSON.parse(repeated.stdout).status, "already-applied");
+      const invalid = invoke(recoverySeed.mailbox.room, "wrong"); assert.equal(invalid.status, 1);
+      const output = [success, repeated, invalid].map(r => r.stdout + r.stderr).join("") + await readFile(f.transitionPath, "utf8");
+      assert.equal(output.includes(recoverySeed.mailbox.room), false); assert.equal(output.includes(seedManifest.steps[0].text), false);
+      for (const bytes of identityBytes.values()) assert.equal(output.includes(JSON.parse(bytes).encryptedPrivateKey.ciphertext), false);
+      await f.unchanged();
     });
 
     assert.equal(network, 0);
