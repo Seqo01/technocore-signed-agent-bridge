@@ -22,6 +22,7 @@ import { peerSessionCommand } from "./swarm/cli.js";
 import { InferenceLedger } from "./agent/inference-accounting.js";
 import { ExternalJobDelivery } from "./swarm/external-delivery.js";
 import { discoveryCommand } from "./discovery/cli.js";
+import { formatDiscoveryFailureDiagnostics } from "./discovery/diagnostics.js";
 
 function usage(): never {
   throw new BridgeError(
@@ -344,5 +345,7 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   console.error(`error: ${safeErrorMessage(error)}`);
+  const diagnostics = formatDiscoveryFailureDiagnostics(error);
+  if (diagnostics) console.error(`diagnostics:\n${diagnostics}`);
   process.exitCode = 1;
 });

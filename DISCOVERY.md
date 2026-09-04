@@ -155,6 +155,22 @@ Size overflow, interrupted body, wrong content type and timeout fail closed. Sto
 capacity refusal preserves old evidence without automatic eviction; the already-made
 GET is not retried. Changing storage capacity requires an explicit reviewed change.
 
+Discovery failures return a bounded `DiscoveryTransportError` with a static message
+and secret-free diagnostics. The recorded stage is one of validation, request,
+response headers/body/status/parse, or persistence. Diagnostics contain only the
+path class (`rooms`, `events`, `public-room`, or `did-note`), dispatch/header/timeout/
+redirect booleans, a numeric byte count, and—only when observed—a numeric status,
+normalized content type, allowlisted error class and allowlisted cause code. They
+never retain a full path/URL, redirect Location, response body, raw error message,
+cause object, capability or authentication material. `dispatched: true` means only
+that the HTTP client call was attempted; it does not prove the server was reached.
+
+The adapter owns the single operation deadline. Its one `AbortSignal` is passed to
+the fetch/Undici transport and covers dispatch plus body reading. The transport has
+no competing timer. Failure diagnostics are printed to stderr for operator review
+but are not persisted; invalid responses cannot create discovery observations or
+candidates. Automatic retries remain zero.
+
 ## CLI — examples, not executed during implementation
 
 Local, no network and no identity unlock:

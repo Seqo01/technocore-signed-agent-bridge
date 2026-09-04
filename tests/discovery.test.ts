@@ -10,6 +10,8 @@ import { TechnocorePublicDiscoveryAdapter } from "../src/discovery/adapter.js";
 import { DiscoveryStore } from "../src/discovery/store.js";
 import { discoveryCommand } from "../src/discovery/cli.js";
 import { HttpDiscoveryReadTransport, assertReadPath, type ReadReply, type DiscoveryReadTransport } from "../src/discovery/transport.js";
+import { DiscoveryTransportError, formatDiscoveryFailureDiagnostics,
+  type DiscoveryFailureDiagnostics, type DiscoveryProgress } from "../src/discovery/diagnostics.js";
 import { candidateId, compareCapabilities, defaults, didPaths, digest, DISCOVERY_ORIGIN, limits, publicRoom, safeTopic,
   type Limits } from "../src/discovery/model.js";
 import { temporaryDirectory } from "./helpers.js";
@@ -45,6 +47,14 @@ class Fake implements DiscoveryReadTransport {
   paths: string[] = [];
   constructor(public queue: ReadReply[]) {}
   async get(path: string, _signal: AbortSignal) { this.paths.push(path); return this.queue.shift() ?? reply("", "text/plain", 404); }
+}
+function diagnostic(error: unknown): DiscoveryFailureDiagnostics {
+  assert.ok(error instanceof DiscoveryTransportError);
+  return error.diagnostics;
+}
+async function failed(operation: Promise<unknown>): Promise<DiscoveryFailureDiagnostics> {
+  try { await operation; assert.fail("expected discovery failure"); }
+  catch (error) { return diagnostic(error); }
 }
 async function setup(queue: ReadReply[], bounds: Partial<Limits> = {}) {
   const dir = await temporaryDirectory(); const store = new DiscoveryStore(dir.path, bounds); const transport = new Fake(queue);
@@ -257,11 +267,18 @@ test("GET request and DID lookup counts never exceed configured budgets", async 
     assert.equal(f.transport.paths.length, 2);
   } finally { await f.cleanup(); }
 });
-test("timeout aborts injected request and persists no late result", async () => {
-  const f = await setup([]); let signal: AbortSignal | undefined;
-  const a = new TechnocorePublicDiscoveryAdapter({ get: (_p, s) => { signal = s; return new Promise(() => undefined); } }, f.store, { timeoutMs: 10 });
-  try { await assert.rejects(a.discoverRooms(), /timed out/u); assert.equal(signal!.aborted, true);
-    assert.equal((await f.store.observations()).length, 0);
+test("one deadline aborts one dispatched request and persists no late result", async () => {
+  const f = await setup([]); let signal: AbortSignal | undefined; let calls = 0;
+  const transport: DiscoveryReadTransport = { get: (_p, s, progress) => {
+    calls++; signal = s; progress?.({ stage: "request", dispatched: true }); return new Promise(() => undefined);
+  } };
+  const a = new TechnocorePublicDiscoveryAdapter(transport, f.store, { timeoutMs: 10 });
+  try {
+    const d = await failed(a.discoverRooms());
+    assert.deepEqual(d, { stage: "request", pathClass: "rooms", dispatched: true, headersReceived: false,
+      timedOut: true, bytesReceived: 0, redirectDetected: false, errorClass: "TimeoutError", causeCode: "ERR_DISCOVERY_TIMEOUT" });
+    assert.equal(signal!.aborted, true); assert.equal(calls, 1); assert.equal((await f.store.observations()).length, 0);
+    assert.deepEqual(await readdir(f.path), []);
   } finally { await f.cleanup(); }
 });
 test("all limits reject nonpositive/unknown/oversized values", () => {
@@ -289,33 +306,85 @@ test("production read client only issues credential-free GET to exact reviewed o
     assert.throws(() => new HttpDiscoveryReadTransport(origin, {}, fetcher));
   }
 });
-test("redirects (including same origin), wrong type and bounded streamed body fail without URL/body leak", async () => {
-  for (const make of [
-    () => new Response("", { status: 302, headers: { location: "https://elsewhere.invalid/private" } }),
-    () => new Response("", { status: 307, headers: { location: "/rooms" } }),
-    () => new Response("x", { headers: { "content-length": "10000" } }),
-    () => new Response("x".repeat(30)),
+test("pre-header DNS and connection-reset failures preserve only safe class/code", async () => {
+  for (const code of ["ENOTFOUND", "ECONNRESET"] as const) {
+    let calls = 0;
+    const secret = `mb-p-${randomBytes(24).toString("hex")}`;
+    const fetcher: typeof fetch = async () => {
+      calls++;
+      throw new TypeError(secret, { cause: Object.assign(new Error(secret), { code }) });
+    };
+    const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, fetcher);
+    const d = await failed(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+    assert.deepEqual(d, { stage: "request", pathClass: "rooms", dispatched: true, headersReceived: false,
+      timedOut: false, bytesReceived: 0, redirectDetected: false, errorClass: "TypeError", causeCode: code });
+    assert.equal(calls, 1); assert.ok(!JSON.stringify(d).includes(secret));
+  }
+});
+test("validation refusal is not dispatched and exposes only the path class", async () => {
+  let calls = 0;
+  const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, async () => { calls++; return new Response(); });
+  const d = await failed(transport.get("/rooms?format=json&limit=1&secret=hidden", new AbortController().signal));
+  assert.deepEqual(d, { stage: "validation", pathClass: "rooms", dispatched: false, headersReceived: false,
+    timedOut: false, bytesReceived: 0, redirectDetected: false, errorClass: "ValidationRefused", causeCode: "ERR_DISCOVERY_VALIDATION" });
+  assert.equal(calls, 0); assert.ok(!JSON.stringify(d).includes("hidden"));
+});
+test("redirects are refused without retaining Location or a full URL", async () => {
+  for (const response of [
+    new Response("", { status: 302, headers: { location: "https://elsewhere.invalid/private" } }),
+    new Response("", { status: 307, headers: { location: "/rooms" } }),
   ]) {
-    const t = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, { responseBytes: 20 }, async () => make());
-    await assert.rejects(t.get("/rooms?format=json&limit=1", new AbortController().signal), /Discovery GET refused or failed/u);
+    const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, async () => response);
+    const d = await failed(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+    assert.equal(d.stage, "response-headers"); assert.equal(d.status, response.status);
+    assert.equal(d.dispatched, true); assert.equal(d.headersReceived, true); assert.equal(d.redirectDetected, true);
+    assert.ok(!JSON.stringify(d).includes("elsewhere")); assert.ok(!JSON.stringify(d).includes("technocore.chat"));
   }
 });
-test("wrong response content type / malformed JSON refused by adapter", async () => {
-  for (const r of [reply("{}", "text/html"), reply("{"), reply({ rooms: "not-array" })]) {
-    const f = await setup([r]); try { await assert.rejects(f.adapter.discoverRooms()); } finally { await f.cleanup(); }
-  }
-});
-test("production client cancels interrupted bodies and reports only a static error", async () => {
+test("declared and streamed body limits preserve byte counts without body text", async () => {
   const secret = randomBytes(24).toString("hex");
-  const fetcher: typeof fetch = async () => new Response(new ReadableStream<Uint8Array>({
-    start(controller) { controller.error(new Error(secret)); },
-  }));
-  const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, fetcher);
-  await assert.rejects(transport.get("/rooms?format=json&limit=1", new AbortController().signal),
-    e => e instanceof Error && e.message === "Discovery GET refused or failed" && !e.cause);
+  const responses = [
+    new Response(secret, { headers: { "content-length": "10000", "content-type": "text/plain" } }),
+    new Response(secret),
+  ];
+  const expectedBytes = [0, Buffer.byteLength(secret)];
+  for (let i = 0; i < responses.length; i++) {
+    const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, { responseBytes: 20 }, async () => responses[i]!);
+    const d = await failed(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+    assert.equal(d.stage, "response-body"); assert.equal(d.bytesReceived, expectedBytes[i]);
+    assert.equal(d.headersReceived, true); assert.equal(d.causeCode, "ERR_DISCOVERY_BODY_LIMIT");
+    assert.ok(!JSON.stringify(d).includes(secret));
+  }
 });
-test("production body timeout aborts a stalled stream, with no retry or persistence", async () => {
-  let calls = 0; let cancelled = false;
+test("wrong response content type and malformed JSON are distinct safe parse failures", async () => {
+  for (const [r, errorClass] of [[reply("{}", "text/html"), "ResponseTypeRefused"],
+    [reply("{"), "ResponseParseRefused"], [reply({ rooms: "not-array" }), "ResponseParseRefused"]] as const) {
+    const f = await setup([r]);
+    try {
+      const d = await failed(f.adapter.discoverRooms());
+      assert.equal(d.stage, "response-parse"); assert.equal(d.errorClass, errorClass);
+      assert.equal(d.headersReceived, true); assert.equal(d.status, 200); assert.equal(d.dispatched, true);
+      assert.equal((await f.store.observations()).length, 0);
+    } finally { await f.cleanup(); }
+  }
+});
+test("production client reports interrupted body without arbitrary error leakage", async () => {
+  const secret = `mb-p-${randomBytes(24).toString("hex")}`;
+  const fetcher: typeof fetch = async () => {
+    let delivered = false;
+    return new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+      if (delivered) controller.error(new Error(secret));
+      else { delivered = true; controller.enqueue(new TextEncoder().encode("abc")); }
+    } }), { headers: { "content-type": "application/json" } });
+  };
+  const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, fetcher);
+  const d = await failed(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+  assert.equal(d.stage, "response-body"); assert.equal(d.headersReceived, true); assert.equal(d.status, 200);
+  assert.equal(d.bytesReceived, 3); assert.equal(d.causeCode, "ERR_DISCOVERY_BODY_INTERRUPTED");
+  assert.ok(!JSON.stringify(d).includes(secret));
+});
+test("production body timeout uses adapter's single deadline with no retry or persistence", async () => {
+  const f = await setup([]); let calls = 0; let cancelled = false;
   const fetcher: typeof fetch = async (_url, init) => {
     calls++;
     return new Response(new ReadableStream<Uint8Array>({ start(controller) {
@@ -323,13 +392,53 @@ test("production body timeout aborts a stalled stream, with no retry or persiste
     } }), { headers: { "content-type": "application/json" } });
   };
   const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, { timeoutMs: 10 }, fetcher);
-  await assert.rejects(transport.get("/rooms?format=json&limit=1", new AbortController().signal), /timed out or was cancelled/u);
-  assert.equal(calls, 1); assert.equal(cancelled, true);
+  const adapter = new TechnocorePublicDiscoveryAdapter(transport, f.store, { timeoutMs: 10 });
+  try {
+    const d = await failed(adapter.discoverRooms());
+    assert.equal(d.stage, "response-body"); assert.equal(d.dispatched, true); assert.equal(d.headersReceived, true);
+    assert.equal(d.timedOut, true); assert.equal(d.status, 200); assert.equal(calls, 1); assert.equal(cancelled, true);
+    assert.deepEqual(await readdir(f.path), []);
+  } finally { await f.cleanup(); }
+});
+test("readable HTTP 400 and 503 preserve status, content type and bytes without body", async () => {
+  for (const status of [400, 503]) {
+    const secret = randomBytes(24).toString("hex"); const f = await setup([reply(secret, "text/plain", status)]);
+    try {
+      const d = await failed(f.adapter.discoverRooms());
+      assert.equal(d.stage, "response-status"); assert.equal(d.status, status); assert.equal(d.contentType, "text/plain");
+      assert.equal(d.bytesReceived, Buffer.byteLength(secret)); assert.equal(d.headersReceived, true); assert.equal(d.dispatched, true);
+      assert.ok(!JSON.stringify(d).includes(secret)); assert.deepEqual(await readdir(f.path), []);
+    } finally { await f.cleanup(); }
+  }
+});
+test("persistence failure is distinguished after a valid parsed response", async () => {
+  const dir = await temporaryDirectory();
+  try {
+    await writeFile(join(dir.path, ".technocore-discovery"), "blocked-local-fixture");
+    const adapter = new TechnocorePublicDiscoveryAdapter(new Fake([reply({ rooms: [{ room: "lobby", topic: "safe" }] })]),
+      new DiscoveryStore(dir.path));
+    const d = await failed(adapter.discoverRooms());
+    assert.equal(d.stage, "persistence"); assert.equal(d.status, 200); assert.equal(d.headersReceived, true);
+    assert.equal(d.dispatched, true); assert.equal(d.errorClass, "PersistenceRefused");
+    assert.equal(d.causeCode, "ERR_DISCOVERY_PERSISTENCE"); assert.ok(!(await readdir(dir.path)).includes(".technocore"));
+  } finally { await dir.cleanup(); }
+});
+test("CLI diagnostic formatter emits only the bounded structured object", () => {
+  const secret = `mb-p-${randomBytes(24).toString("hex")}`;
+  const error = new DiscoveryTransportError({ stage: "request", pathClass: "rooms", dispatched: true,
+    headersReceived: false, timedOut: false, bytesReceived: 0, redirectDetected: false,
+    errorClass: secret, causeCode: secret });
+  assert.equal(error.message, "Discovery GET failed; no retry"); assert.equal(error.cause, undefined);
+  const rendered = formatDiscoveryFailureDiagnostics(error)!; const parsed = JSON.parse(rendered);
+  assert.deepEqual(parsed, { stage: "request", pathClass: "rooms", dispatched: true, headersReceived: false,
+    timedOut: false, bytesReceived: 0, redirectDetected: false });
+  assert.ok(!rendered.includes(secret)); assert.ok(!rendered.includes("http"));
 });
 test("fabricated followed-redirect response URL is rejected even on HTTP 200", async () => {
   const response = new Response("{}"); Object.defineProperty(response, "url", { value: "https://elsewhere.invalid/rooms" });
   const transport = new HttpDiscoveryReadTransport(DISCOVERY_ORIGIN, {}, async () => response);
-  await assert.rejects(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+  const d = await failed(transport.get("/rooms?format=json&limit=1", new AbortController().signal));
+  assert.equal(d.redirectDetected, true); assert.equal(d.status, 200); assert.equal(d.stage, "response-headers");
 });
 test("lookup-only DIDs are distinguished from actual structured message observations", async () => {
   const f = await setup([note({ role: "review" }), window("lobby", [message(other)])]);
@@ -340,8 +449,12 @@ test("lookup-only DIDs are distinguished from actual structured message observat
 });
 test("untrusted error text is discarded", async () => {
   const f = await setup([]); const secret = randomBytes(24).toString("hex");
-  try { const a = new TechnocorePublicDiscoveryAdapter({ get: async () => { throw new Error(secret); } }, f.store);
-    await assert.rejects(a.discoverRooms(), e => e instanceof Error && !e.message.includes(secret) && !e.cause);
+  try { const a = new TechnocorePublicDiscoveryAdapter({ get: async (_path, _signal, progress?: DiscoveryProgress) => {
+      progress?.({ stage: "request", dispatched: true }); const e = Object.assign(new Error(secret), { name: secret, code: secret }); throw e;
+    } }, f.store);
+    const d = await failed(a.discoverRooms()); const output = `${formatDiscoveryFailureDiagnostics(new DiscoveryTransportError(d))}`;
+    assert.equal(d.errorClass, undefined); assert.equal(d.causeCode, undefined); assert.ok(!output.includes(secret));
+    assert.ok(!output.includes("http")); assert.deepEqual(await readdir(f.path), []);
   } finally { await f.cleanup(); }
 });
 test("raw secrets/URLs/unknown claims are neither persisted, output, followed nor turned into contacts", async () => {

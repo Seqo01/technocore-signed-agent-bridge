@@ -1,17 +1,27 @@
-import { BridgeError } from "../errors.js";
 import { sanitizeText, verifySignedMessage } from "../protocol.js";
 import { candidateId, didPaths, digest, DISCOVERY_ORIGIN, isClaim, isDid, limits, publicRoom, safeTopic, TRUST,
   unique, type EndpointClass, type Limits, type NewObservation, type Warning, type Claim } from "./model.js";
 import { DiscoveryStore } from "./store.js";
 import { assertReadPath, type DiscoveryReadTransport, type ReadReply } from "./transport.js";
+import { classifyDiscoveryPath, diagnosticsFromError, DiscoveryTransportError,
+  initialDiscoveryDiagnostics, normalizeDiscoveryContentType, safeDiscoveryDiagnostics,
+  type DiscoveryFailureDiagnostics } from "./diagnostics.js";
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
-function json(body: string): Record<string, unknown> {
+function refusal(
+  diagnostics: DiscoveryFailureDiagnostics,
+  stage: DiscoveryFailureDiagnostics["stage"],
+  errorClass: string,
+  causeCode: string,
+): DiscoveryTransportError {
+  return new DiscoveryTransportError(diagnosticsFromError(diagnostics, undefined, { stage, errorClass, causeCode }));
+}
+function json(body: string, diagnostics: DiscoveryFailureDiagnostics): Record<string, unknown> {
   try { const value = object(JSON.parse(body)); if (value) return value; } catch { /* Never forward parse errors/body. */ }
-  throw new BridgeError("Discovery response schema refused");
+  throw refusal(diagnostics, "response-parse", "ResponseParseRefused", "ERR_DISCOVERY_PARSE");
 }
 function base(endpointClass: EndpointClass, sourceRef: string, content: string): NewObservation {
   return { endpointClass, sourceRef, sourceOrigin: DISCOVERY_ORIGIN, sourceHash: digest(DISCOVERY_ORIGIN + sourceRef),
@@ -49,33 +59,56 @@ export class TechnocorePublicDiscoveryAdapter {
     bounds: Partial<Limits> = {}, private readonly now: () => string = () => new Date().toISOString()) {
     this.bounds = limits(bounds);
   }
-  private async read(path: string): Promise<ReadReply> {
-    assertReadPath(path);
-    if (this.requests >= this.bounds.requests) throw new BridgeError("Discovery request budget exhausted");
+  private async read(path: string): Promise<{ reply: ReadReply; diagnostics: DiscoveryFailureDiagnostics }> {
+    let diagnostics = initialDiscoveryDiagnostics(classifyDiscoveryPath(path));
+    try { assertReadPath(path); }
+    catch (error) { throw new DiscoveryTransportError(diagnosticsFromError(diagnostics, error,
+      { errorClass: "ValidationRefused", causeCode: "ERR_DISCOVERY_VALIDATION" })); }
+    if (this.requests >= this.bounds.requests) throw refusal(diagnostics, "validation", "ValidationRefused", "ERR_DISCOVERY_VALIDATION");
     this.requests++;
     const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const reply = await Promise.race([this.transport.get(path, controller.signal), new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { controller.abort(); reject(new BridgeError("Discovery GET timed out")); }, this.bounds.timeoutMs);
+      const reply = await Promise.race([this.transport.get(path, controller.signal, update => {
+        diagnostics = safeDiscoveryDiagnostics({ ...diagnostics, ...update });
+      }), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(refusal({ ...diagnostics, timedOut: true }, diagnostics.headersReceived ? "response-body" : "request",
+            "TimeoutError", "ERR_DISCOVERY_TIMEOUT"));
+        }, this.bounds.timeoutMs);
       })]);
+      const status = reply?.status;
+      const contentType = normalizeDiscoveryContentType(reply?.contentType);
+      const bytesReceived = typeof reply?.body === "string" ? Buffer.byteLength(reply.body) : diagnostics.bytesReceived;
+      diagnostics = safeDiscoveryDiagnostics({ ...diagnostics, stage: "response-headers", dispatched: true,
+        headersReceived: true, bytesReceived, ...(integer(status) && status >= 100 && status <= 599 ? { status } : {}),
+        ...(contentType ? { contentType } : {}) });
       if (!reply || !integer(reply.status) || reply.status < 100 || reply.status > 599 || typeof reply.body !== "string" ||
-        Buffer.byteLength(reply.body) > this.bounds.responseBytes) throw new BridgeError("Discovery response limit or shape refused");
-      if (reply.status !== 200 && reply.status !== 404) throw new BridgeError(`Discovery GET refused (HTTP ${reply.status}); no retry`);
-      return reply;
+        bytesReceived > this.bounds.responseBytes) throw refusal(diagnostics, "response-body", "ResponseShapeRefused", "ERR_DISCOVERY_RESPONSE_SHAPE");
+      if (reply.status !== 200 && reply.status !== 404) {
+        throw refusal(diagnostics, "response-status", "ResponseStatusRefused", "ERR_DISCOVERY_RESPONSE_STATUS");
+      }
+      return { reply, diagnostics };
     } catch (error) {
-      if (error instanceof BridgeError && /^(?:Discovery GET timed out|Discovery response limit or shape refused|Discovery GET refused \(HTTP \d{3}\); no retry)$/u.test(error.message)) throw error;
-      throw new BridgeError("Discovery GET failed; no retry");
+      if (error instanceof DiscoveryTransportError) throw error;
+      throw new DiscoveryTransportError(diagnosticsFromError(diagnostics, error,
+        { stage: diagnostics.headersReceived ? "response-body" : "request" }));
     } finally { if (timer) clearTimeout(timer); controller.abort(); }
   }
-  private async save(batch: NewObservation[]) {
-    await this.store.append(batch, this.now());
+  private async save(batch: NewObservation[], diagnostics: DiscoveryFailureDiagnostics) {
+    try { await this.store.append(batch, this.now()); }
+    catch (error) { throw new DiscoveryTransportError(diagnosticsFromError(diagnostics, error,
+      { stage: "persistence", errorClass: "PersistenceRefused", causeCode: "ERR_DISCOVERY_PERSISTENCE" })); }
     return { retainedObservations: batch.length, networkGets: this.requests, authority: false as const };
   }
   async discoverRooms() {
-    const reply = await this.read(`/rooms?format=json&limit=${this.bounds.rooms}`);
-    if (reply.status !== 200 || reply.contentType !== "application/json") throw new BridgeError("Discovery rooms response refused");
-    const value = json(reply.body);
-    if (!Array.isArray(value.rooms) || value.rooms.length > this.bounds.rooms) throw new BridgeError("Discovery room limit or schema refused");
+    const { reply, diagnostics } = await this.read(`/rooms?format=json&limit=${this.bounds.rooms}`);
+    if (reply.status !== 200) throw refusal(diagnostics, "response-status", "ResponseStatusRefused", "ERR_DISCOVERY_RESPONSE_STATUS");
+    if (reply.contentType !== "application/json") throw refusal(diagnostics, "response-parse", "ResponseTypeRefused", "ERR_DISCOVERY_RESPONSE_TYPE");
+    const value = json(reply.body, diagnostics);
+    if (!Array.isArray(value.rooms) || value.rooms.length > this.bounds.rooms) {
+      throw refusal(diagnostics, "response-parse", "ResponseParseRefused", "ERR_DISCOVERY_PARSE");
+    }
     const batch: NewObservation[] = []; let skipped = 0;
     for (const item of value.rooms) {
       const r = object(item);
@@ -86,7 +119,7 @@ export class TechnocorePublicDiscoveryAdapter {
       if (o.topic !== r.topic && r.topic != null) o.warnings.push("content-omitted");
       batch.push(o);
     }
-    return { ...await this.save(batch), skipped, rooms: batch.map(o => ({ room: o.room, topic: o.topic, trust: TRUST })) };
+    return { ...await this.save(batch, diagnostics), skipped, rooms: batch.map(o => ({ room: o.room, topic: o.topic, trust: TRUST })) };
   }
   async discoverEvents(since = 0) { return this.readMessages("events", since, true); }
   /** Explicit selection only. Never called automatically from rooms/events/metadata. */
@@ -95,14 +128,20 @@ export class TechnocorePublicDiscoveryAdapter {
     return this.readMessages(room, since, false);
   }
   private async readMessages(room: string, since: number, events: boolean) {
-    if (!publicRoom(room) || !integer(since) || since > 999999999999999) throw new BridgeError("Discovery public room or cursor refused");
-    const reply = await this.read(`/r/${room}?format=json&since=${since}&limit=${this.bounds.events}&wait=0`);
-    if (reply.status !== 200 || reply.contentType !== "application/json") throw new BridgeError("Discovery room response refused");
-    const value = json(reply.body);
+    if (!publicRoom(room) || !integer(since) || since > 999999999999999) {
+      throw refusal(initialDiscoveryDiagnostics(room === "events" ? "events" : "public-room"), "validation",
+        "ValidationRefused", "ERR_DISCOVERY_VALIDATION");
+    }
+    const { reply, diagnostics } = await this.read(`/r/${room}?format=json&since=${since}&limit=${this.bounds.events}&wait=0`);
+    if (reply.status !== 200) throw refusal(diagnostics, "response-status", "ResponseStatusRefused", "ERR_DISCOVERY_RESPONSE_STATUS");
+    if (reply.contentType !== "application/json") throw refusal(diagnostics, "response-parse", "ResponseTypeRefused", "ERR_DISCOVERY_RESPONSE_TYPE");
+    const value = json(reply.body, diagnostics);
     if (value.room !== room || !Array.isArray(value.messages) || value.messages.length > this.bounds.events ||
       value.count !== value.messages.length || !integer(value.last_seq) ||
       !(value.first_seq === null || integer(value.first_seq)) ||
-      (value.generation !== undefined && !integer(value.generation))) throw new BridgeError("Discovery message window refused");
+      (value.generation !== undefined && !integer(value.generation))) {
+      throw refusal(diagnostics, "response-parse", "ResponseParseRefused", "ERR_DISCOVERY_PARSE");
+    }
     const batch: NewObservation[] = [];
     let previous = since;
     const gap = typeof value.first_seq === "number" && value.first_seq > since + 1;
@@ -142,21 +181,30 @@ export class TechnocorePublicDiscoveryAdapter {
       } else { o.warnings.push("content-omitted"); }
       batch.push(o);
     }
-    return { ...await this.save(batch), retentionGap: gap, lastReturnedSeq: previous === since ? null : previous,
+    return { ...await this.save(batch, diagnostics), retentionGap: gap, lastReturnedSeq: previous === since ? null : previous,
       reportedLastSeq: value.last_seq, completeHistory: false, noCursorMutation: true };
   }
   async lookupDidMetadata(did: string) {
-    const paths = didPaths(did);
-    if (this.lookups >= this.bounds.didLookups) throw new BridgeError("Discovery DID lookup budget exhausted");
+    let paths: ReturnType<typeof didPaths>;
+    try { paths = didPaths(did); }
+    catch (error) { throw new DiscoveryTransportError(diagnosticsFromError(initialDiscoveryDiagnostics("did-note"), error,
+      { errorClass: "ValidationRefused", causeCode: "ERR_DISCOVERY_VALIDATION" })); }
+    if (this.lookups >= this.bounds.didLookups) throw refusal(initialDiscoveryDiagnostics("did-note"), "validation",
+      "ValidationRefused", "ERR_DISCOVERY_VALIDATION");
     this.lookups++;
     const batch: NewObservation[] = [];
+    let persistenceDiagnostics = initialDiscoveryDiagnostics("did-note");
     for (const [kind, path] of [["did-current", paths.current], ["did-legacy", paths.legacy]] as const) {
-      const reply = await this.read(path);
+      const { reply, diagnostics } = await this.read(path);
+      persistenceDiagnostics = diagnostics;
       const o = base(kind, path, reply.status === 404 ? "not-found" : reply.body);
       o.claimedDid = did; o.candidateId = candidateId(did); o.provenanceClassification = "third-party-claim";
       o.warnings = ["note-not-owner-authenticated"];
       if (reply.status === 404) { o.warnings.push("not-found"); batch.push(o); continue; }
-      if (reply.contentType !== "text/plain" || Buffer.byteLength(reply.body) > this.bounds.metadataBytes) throw new BridgeError("Discovery note response refused");
+      if (reply.contentType !== "text/plain") throw refusal(diagnostics, "response-parse", "ResponseTypeRefused", "ERR_DISCOVERY_RESPONSE_TYPE");
+      if (Buffer.byteLength(reply.body) > this.bounds.metadataBytes) {
+        throw refusal(diagnostics, "response-body", "BodyLimitRefused", "ERR_DISCOVERY_BODY_LIMIT");
+      }
       const value = noteValue(reply.body);
       if (value === undefined) { o.provenanceClassification = "malformed"; o.warnings.push("malformed-record"); }
       else {
@@ -165,7 +213,7 @@ export class TechnocorePublicDiscoveryAdapter {
       }
       batch.push(o); break; // Fallback ONLY after actual 404, never malformed/empty/5xx.
     }
-    return { ...await this.save(batch), candidateId: candidateId(did) };
+    return { ...await this.save(batch, persistenceDiagnostics), candidateId: candidateId(did) };
   }
   listCandidates() { return this.store.listCandidates(); }
   inspectCandidate(id: string) { return this.store.inspectCandidate(id); }
