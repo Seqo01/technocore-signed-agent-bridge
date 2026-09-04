@@ -46,6 +46,24 @@ operator-assisted workflow. Preparation is local; every eventual signed send sti
 its own exact approval. The runner never auto-approves, polls continuously, or treats
 deterministic fixtures as live research.
 
+The separate [peer session supervisor](PEER-SESSIONS.md) owns five independently
+addressable runtimes. Alice is optional in a job: Bob, Charlie, Dave and Eve can
+delegate along explicitly authorized directional pairs. A task DAG, immutable root
+provenance and bounded session authority govern compute and signed delivery.
+Session authority grants individual exact-action records only for reviewed internal
+effects; external work and ambiguous recovery still require separate operator decisions.
+It does not activate or recover the historical rehearsal.
+
+The safest first autonomous peer test uses only generated temporary identities and
+an injected in-memory transport:
+
+```powershell
+npm.cmd run test:peer
+```
+
+There is no configured real inference provider in the CLI and no automatic live
+fallback. See [peer session commands and limits](PEER-SESSIONS.md#commands).
+
 ## Quick start
 
 Requirements: Node.js 22 or newer and npm.

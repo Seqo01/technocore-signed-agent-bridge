@@ -18,6 +18,7 @@ const WORK_FIELDS: Record<string, readonly string[]> = {
   "workload.review": ["question", "producedResult", "expectedOutputHash", "criteria"],
   "workload.specialist": ["question", "focus", "suppliedContext"],
   "workload.coordination": ["question", "phase", "requiredEvidenceHashes"],
+  "workload.synthesis": ["question", "phase", "requiredEvidenceHashes"],
 };
 
 export function validateWorkRequest(type: string, payload: Record<string, unknown>): Record<string, unknown> {
@@ -60,7 +61,7 @@ export interface DelegationRecord {
 export class LocalSwarmRouter {
   private readonly endpoints = new Map<string, LocalAgentEndpoint>();
 
-  constructor(endpoints: LocalAgentEndpoint[]) {
+  constructor(endpoints: LocalAgentEndpoint[], private readonly authorize?: (request: DelegationRequest) => Promise<void>) {
     const dids = new Set<string>();
     for (const endpoint of endpoints) {
       assertLocalAlias(endpoint.binding.alias);
@@ -93,7 +94,9 @@ export class LocalSwarmRouter {
     input = structuredClone(input);
     const source = this.require(input.source);
     const target = this.require(input.target);
-    if (source.role !== "coordinator" || source.did === target.did) throw new BridgeError("Only a coordinator delegates to a distinct peer");
+    if (source.did === target.did) throw new BridgeError("Delegation requires a distinct peer");
+    if (this.authorize) await this.authorize(input);
+    else if (source.role !== "coordinator") throw new BridgeError("Only a coordinator delegates to a distinct peer");
     if (!(await source.state.load()).tasks[input.parentTaskId]) throw new BridgeError("Delegation requires an existing source parent task");
     if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(input.key)) throw new BridgeError("Invalid delegation key");
     assertRoleWorkload(target.role!, input.workload);
@@ -129,6 +132,8 @@ export class LocalSwarmRouter {
         throw new BridgeError("Invalid durable delegation record");
       }
       const target = this.require(record.target);
+      if (this.authorize) await this.authorize({ source: record.source, target: record.target,
+        parentTaskId: record.parentTaskId, key: id, workload: record.workload, payload: record.payload, evidence: record.context.evidence });
       assertRoleWorkload(target.role!, record.workload);
       // Enqueue is itself idempotent, including a crash between dispatch and this checkpoint.
       const task = await target.enqueueTask({ id: record.taskId, idempotencyKey: `delegation:${id}`,

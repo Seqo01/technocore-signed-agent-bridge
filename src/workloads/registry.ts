@@ -5,6 +5,7 @@ import { researchWorkload } from "./research.js";
 import { reviewWorkload } from "./review.js";
 import { specialistWorkload } from "./specialist.js";
 import { coordinationWorkload } from "./coordination.js";
+import { synthesisWorkload } from "./synthesis.js";
 import type { WorkloadDefinition } from "./types.js";
 
 type RegisteredWorkload = WorkloadDefinition<any, any>;
@@ -42,5 +43,6 @@ export function createDefaultWorkloadRegistry(): WorkloadRegistry {
     reviewWorkload,
     specialistWorkload,
     coordinationWorkload,
+    synthesisWorkload,
   ]);
 }

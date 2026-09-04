@@ -655,8 +655,10 @@ export class AgentRuntime {
     if (this.stopRequested) return 0;
     const bridge = this.requireBridge();
     options.onStage?.("transport");
-    const peek = await bridge.peekInbox(this.identityAlias, options.since === undefined ? {} : { since: options.since });
-    return this.persistInbox(peek, options);
+    return bridge.withIntakeOwnership(this.identityAlias, async () => {
+      const peek = await bridge.peekInbox(this.identityAlias, options.since === undefined ? {} : { since: options.since });
+      return this.persistInbox(peek, options);
+    });
   }
 
   /** Host-only offline continuation of an already retained, policy-validated observation.

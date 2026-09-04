@@ -18,6 +18,7 @@ export interface BridgeStores {
   cursors: CursorStore;
   nonces: NonceStore;
   approvals: ActionApprovalStore;
+  intake?: <T>(owner: string, operation: () => Promise<T>) => Promise<T>;
 }
 
 export interface InboxPeekResult {
@@ -32,6 +33,10 @@ export class SignedAgentBridge {
     private readonly stores: BridgeStores,
     private readonly transport: TechnocoreTransport,
   ) {}
+
+  withIntakeOwnership<T>(owner: string, operation: () => Promise<T>): Promise<T> {
+    return this.stores.intake ? this.stores.intake(owner, operation) : operation();
+  }
 
   async prepareContactSend(sender: string, contactId: string, text: string, actionId?: string) {
     const identity = await this.stores.identities.inspect(sender);
@@ -139,14 +144,20 @@ export class SignedAgentBridge {
   }
 
   async readInbox(owner: string): Promise<InboxMessage[]> {
-    const peek = await this.peekInbox(owner);
-    if (peek.lastSeq > peek.previousCursor) {
-      await this.acknowledgeInbox(owner, peek.lastSeq);
-    }
-    return peek.messages;
+    return this.withIntakeOwnership(owner, async () => {
+      const peek = await this.peekInbox(owner);
+      if (peek.lastSeq > peek.previousCursor) {
+        await this.acknowledgeInbox(owner, peek.lastSeq);
+      }
+      return peek.messages;
+    });
   }
 
   async peekInbox(owner: string, query: { since?: number } = {}): Promise<InboxPeekResult> {
+    return this.withIntakeOwnership(owner, () => this.peekOwnedInbox(owner, query));
+  }
+
+  private async peekOwnedInbox(owner: string, query: { since?: number }): Promise<InboxPeekResult> {
     const mailbox = await this.stores.mailboxes.load(owner);
     const since = await this.stores.cursors.get(owner, mailbox.room);
     if (query.since !== undefined && (!Number.isSafeInteger(query.since) || query.since < 0)) {
@@ -184,7 +195,9 @@ export class SignedAgentBridge {
   }
 
   async acknowledgeInbox(owner: string, seq: number): Promise<void> {
-    const mailbox = await this.stores.mailboxes.load(owner);
-    await this.stores.cursors.advance(owner, mailbox.room, seq);
+    return this.withIntakeOwnership(owner, async () => {
+      const mailbox = await this.stores.mailboxes.load(owner);
+      await this.stores.cursors.advance(owner, mailbox.room, seq);
+    });
   }
 }

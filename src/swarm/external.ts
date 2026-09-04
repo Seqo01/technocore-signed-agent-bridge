@@ -49,7 +49,8 @@ export class ExternalTaskRouter {
     return proposals;
   }
 
-  private async classify(task: AgentTask): Promise<ExternalTaskProposal> {
+  /** Host-only adapter for unified intake; performs no read and no cursor acknowledgement. */
+  async classify(task: AgentTask): Promise<ExternalTaskProposal> {
     const senderDid = String(task.payload.senderDid);
     let request: ExternalWorkRequest | undefined;
     let reason: string | undefined;

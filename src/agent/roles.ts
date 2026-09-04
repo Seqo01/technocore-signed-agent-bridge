@@ -6,8 +6,8 @@ import type { PublicIdentity } from "../types.js";
 export const AGENT_ROLES = ["coordinator", "researcher", "engineer", "reviewer", "specialist"] as const;
 export type AgentRole = typeof AGENT_ROLES[number];
 export const ROLE_WORKLOADS: Readonly<Record<AgentRole, readonly string[]>> = Object.freeze({
-  coordinator: Object.freeze(["workload.coordination", "workload.collaboration"]),
-  researcher: Object.freeze(["workload.research", "workload.collaboration"]),
+  coordinator: Object.freeze(["workload.coordination", "workload.synthesis", "workload.collaboration"]),
+  researcher: Object.freeze(["workload.research", "workload.synthesis", "workload.collaboration"]),
   engineer: Object.freeze(["workload.engineering", "workload.collaboration"]),
   reviewer: Object.freeze(["workload.review", "workload.collaboration"]),
   specialist: Object.freeze(["workload.specialist", "workload.collaboration"]),

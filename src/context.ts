@@ -8,6 +8,7 @@ import { NonceStore } from "./nonce-store.js";
 import { bridgePaths } from "./paths.js";
 import type { TechnocoreTransport } from "./types.js";
 import type { PassphraseProvider } from "./passphrase.js";
+import { withMailboxOwner } from "./swarm/mailbox-owner.js";
 
 export function createStores(root?: string, passphrases?: PassphraseProvider) {
   const paths = bridgePaths(root);
@@ -19,6 +20,10 @@ export function createStores(root?: string, passphrases?: PassphraseProvider) {
     cursors: new CursorStore(paths.cursors),
     nonces: new NonceStore(paths.nonces),
     approvals: new ActionApprovalStore(paths.approvals),
+    intake: async <T>(owner: string, operation: () => Promise<T>): Promise<T> => {
+      const mailbox = await new MailboxStore(paths.mailboxes).load(owner);
+      return withMailboxOwner(paths.root, mailbox.room, operation);
+    },
   };
 }
 

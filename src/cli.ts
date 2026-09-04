@@ -18,10 +18,13 @@ import { FirstRehearsal, type AnalysisPacket } from "./rehearsal/runner.js";
 import { ALIASES, type Alias } from "./rehearsal/setup.js";
 import { FirstReceiptReconciliation } from "./rehearsal/reconciliation.js";
 import { SendReconciliation } from "./rehearsal/send-reconciliation.js";
+import { peerSessionCommand } from "./swarm/cli.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
+    "swarm:start --offline --policy <file> --policy-hash <hash> | swarm:status <id> | swarm:stop <id> | " +
+    "peer:capabilities <alias> --policy <file> --policy-hash <hash> | peer:submit <alias> <file> --session <id> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
     "agent:init <existing-identity> | agent:role <alias> <role> <expected-did> | " +
     "rehearsal:prepare | rehearsal:status | rehearsal:send <action-id> <action-hash> | " +
@@ -62,6 +65,9 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
+  if (["swarm:start", "swarm:status", "swarm:stop", "peer:capabilities", "peer:submit"].includes(command)) {
+    await peerSessionCommand(command, args); return;
+  }
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);
 
   switch (command) {
