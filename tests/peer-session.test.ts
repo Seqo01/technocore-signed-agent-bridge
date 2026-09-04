@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { before, after, test } from "node:test";
 import { cp, readFile, readdir } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { Socket } from "node:net";
 import { createStores, createBridge } from "../src/context.js";
@@ -18,6 +19,7 @@ import { validatePeerWindow, classifyEffectObservation } from "../src/swarm/peer
 import { offlinePeerInference } from "../src/swarm/offline-inference.js";
 import { PeerEffectReconciliation } from "../src/swarm/effect-reconciliation.js";
 import { peerSessionCommand } from "../src/swarm/cli.js";
+import { ExternalJobDelivery } from "../src/swarm/external-delivery.js";
 import { DeterministicInferenceProvider } from "../src/agent/inference.js";
 import { InferenceLedger, defaultInferenceBudgets } from "../src/agent/inference-accounting.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
@@ -25,7 +27,7 @@ import { SignedPostRejectedError } from "../src/send-diagnostics.js";
 import { AmbiguousSendError } from "../src/errors.js";
 import { atomicWriteJson } from "../src/fs-safe.js";
 import type { ReadRoomOptions, RoomResponse, SignedMessageEnvelope } from "../src/types.js";
-import { generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
+import { approveContactSend, generatedPassphraseProvider, temporaryDirectory } from "./helpers.js";
 
 const secrets = generatedPassphraseProvider();
 let template: Awaited<ReturnType<typeof temporaryDirectory>>;
@@ -579,4 +581,250 @@ test("retention and epoch ambiguity never advance the session cursor or retry th
     assert.equal(await state.cursors.get("bob", room), 1); assert.equal(f.transport.reads, 1);
     await assert.rejects(s.receive("bob"), /inactive/); assert.equal(f.transport.reads, 1);
   } finally { await s.stop(); await f.tmp.cleanup(); }
+});
+
+async function externalJob(alias: PeerAlias = "bob", withContact = true, chain = false, limits: Partial<SessionPolicy["limits"]> = {}) {
+  const f = await fixture();
+  Object.assign(f.policy.limits, limits);
+  const mailbox = await f.stores.mailboxes.create("externalfixture", externalDid);
+  if (withContact) await f.stores.contacts.add(alias, "externalfixture", externalDid, mailbox.room);
+  const localMailbox = await f.stores.mailboxes.load(alias);
+  await f.stores.contacts.add("externalfixture", alias, f.policy.members.find(m => m.alias === alias)!.did, localMailbox.room);
+  const p = proposal(f.policy, alias, externalDid);
+  const externalBridge = createBridge(f.transport, f.tmp.path, secrets.provider);
+  const enqueueExternal = async (value = p) => {
+    const text = JSON.stringify(value);
+    const approval = await approveContactSend(externalBridge, f.stores, "externalfixture", alias, text);
+    await externalBridge.sendTo("externalfixture", alias, text, approval);
+  };
+  await enqueueExternal(); f.transport.writes = 0;
+  const original = await snapshotInputs(f.tmp.path);
+  const s = await f.start(); await s.receive(alias);
+  const pending = Object.values(s.snapshot().proposals).find(v => v.trust === "external")!;
+  assert.equal(pending.status, "needs-operator"); assert.equal(Object.keys(s.snapshot().tasks).length, 0);
+  const bob = f.policy.members.find(m => m.alias === "bob")!.did, dave = f.policy.members.find(m => m.alias === "dave")!.did;
+  const scope = { workloads: chain ? ["workload.research", "workload.review"] : [defaultWork[alias]],
+    pairs: chain ? [pairId(bob, dave), pairId(dave, bob)] : [], maxTasks: chain ? 3 : 1, approvalHash: "" };
+  scope.approvalHash = hashValue({ proposalId: pending.id, expectedHash: pending.hash, workloads: scope.workloads, pairs: scope.pairs, maxTasks: scope.maxTasks });
+  const root = await s.approveExternal(pending.id, pending.hash, scope);
+  let selected = root;
+  if (chain) {
+    const review = await s.delegate(root, "dave", "workload.review", input("workload.review"));
+    selected = await s.delegate(review, "bob", "workload.research", { ...input("workload.research"), objective: "Synthesize the supplied review evidence" });
+  }
+  await untilIdle(s);
+  assert.equal(s.snapshot().tasks[selected]!.compute, "result-ready");
+  const directory = sessionDirectory(f.tmp.path, f.policy.sessionId);
+  const service = () => new ExternalJobDelivery({ root: f.tmp.path, sessionId: f.policy.sessionId, passphrases: secrets.provider, offlineTransport: f.transport });
+  return { ...f, s, root, selected, pending, original, mailbox, directory, service, enqueueExternal, p,
+    ledger: () => readFile(resolve(directory, "inference-usage.json"), "utf8") };
+}
+
+for (const alias of ["bob", "charlie", "dave", "eve"] as PeerAlias[]) {
+  test(`external completed ${alias} result is delivered directly once, with separate exact authority and no compute replay`, async () => {
+    const f = await externalJob(alias);
+    try {
+      const ledger = await f.ledger();
+      await assert.rejects(f.service().prepare(f.pending.id, f.selected)); // Active sessions cannot be resumed through delivery.
+      await f.s.stop();
+      const checkpoint = await readFile(resolve(f.directory, "session.json"), "utf8");
+      const reply = await f.service().prepare(f.pending.id, f.selected);
+      assert.equal(reply.compute, "completed"); assert.equal(reply.delivery, "response-prepared");
+      assert.equal(reply.responderAlias, alias); assert.equal(reply.requesterDid, externalDid);
+      assert.ok(reply.actionHash); assert.ok(reply.actionId);
+      const fresh = f.service();
+      assert.deepEqual(await fresh.prepare(f.pending.id, f.selected), reply);
+      await assert.rejects(fresh.send(reply.effectId, reply.actionHash)); assert.equal(f.transport.writes, 0);
+      await assert.rejects(fresh.authorize(reply.effectId, "0".repeat(64)));
+      await fresh.authorize(reply.effectId, reply.actionHash);
+      const sent = await f.service().send(reply.effectId, reply.actionHash);
+      assert.equal(sent.delivery, "sent"); assert.equal(sent.completion, "completed"); assert.equal(sent.postAttempts, 1);
+      await assert.rejects(f.service().send(reply.effectId, reply.actionHash)); assert.equal(f.transport.writes, 1);
+      const received = await f.transport.readRoomJson(f.mailbox.room);
+      assert.equal(received.count, 1);
+      const envelope = JSON.parse(received.messages[0]!.text);
+      assert.equal(envelope.kind, "external-result"); assert.equal(envelope.proposalId, f.p.proposalId);
+      assert.equal(envelope.responderDid, f.policy.members.find(m => m.alias === alias)!.did);
+      assert.equal(envelope.requesterDid, externalDid); assert.equal(envelope.evidenceRefs.length, 1);
+      assert.equal(envelope.evidenceRefs[0].inferenceAttemptId, JSON.parse(ledger).attempts[0].attemptId);
+      assert.deepEqual(envelope.output, f.s.snapshot().tasks[f.selected]!.evidence!.output);
+      assert.equal(await f.ledger(), ledger); assert.equal(await readFile(resolve(f.directory, "session.json"), "utf8"), checkpoint);
+      assert.deepEqual(await snapshotInputs(f.tmp.path), f.original);
+      assert.equal(Object.values(f.s.snapshot().tasks).some(t => t.alias === "alice"), false);
+    } finally { await f.s.stop(); await f.tmp.cleanup(); }
+  });
+}
+
+test("external X -> Bob -> Dave -> Bob -> X preserves provenance, child evidence and three distinct compute attempts", async () => {
+  const f = await externalJob("bob", true, true);
+  try {
+    await f.s.stop(); const ledger = await f.ledger();
+    const reply = await f.service().prepare(f.pending.id, f.selected);
+    assert.ok(reply.actionHash); assert.equal(reply.evidenceRefs!.length, 3);
+    const attempts = JSON.parse(ledger).attempts;
+    assert.equal(attempts.length, 3); assert.equal(attempts.filter((a: any) => a.context.taskId === f.root).length, 1);
+    for (const a of attempts) { assert.equal(a.context.rootRequesterDid, externalDid); assert.equal(a.context.rootOrigin, "external"); }
+    await f.service().authorize(reply.effectId, reply.actionHash);
+    const result = await f.service().send(reply.effectId, reply.actionHash);
+    assert.equal(result.delivery, "sent"); assert.equal(await f.ledger(), ledger);
+    assert.equal(Object.values(f.s.snapshot().tasks).some(t => t.alias === "alice"), false);
+    assert.equal(f.transport.writes, 5); // Four internal proposal/result effects plus one external reply.
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+for (const failure of ["timeout", "503", "reset", "malformed", "400"] as const) {
+  test(`${failure} external delivery preserves compute and never resends or treats absence as non-commit`, async () => {
+    const f = await externalJob();
+    try {
+      await f.s.stop(); const ledger = await f.ledger(), snapshot = await readFile(resolve(f.directory, "session.json"), "utf8");
+      const reply = await f.service().prepare(f.pending.id, f.selected); assert.ok(reply.actionHash);
+      await f.service().authorize(reply.effectId, reply.actionHash); f.transport.failure = failure;
+      const result = await f.service().send(reply.effectId, reply.actionHash);
+      assert.equal(result.compute, "completed"); assert.equal(result.delivery, failure === "400" ? "failed" : "delivery-ambiguous");
+      assert.equal(result.postAttempts, 1); assert.equal(f.transport.writes, 1);
+      await assert.rejects(f.service().send(reply.effectId, reply.actionHash));
+      const observed = await f.service().observeRetained(reply.effectId, { count: 0, first_seq: null, last_seq: 0, messages: [] });
+      assert.equal(observed.observation, "not-observed"); assert.equal(observed.decision, "needs-operator");
+      assert.equal(observed.compute, "completed"); assert.equal(observed.delivery, result.delivery);
+      assert.equal(await f.ledger(), ledger); assert.equal(await readFile(resolve(f.directory, "session.json"), "utf8"), snapshot);
+      assert.equal(f.transport.writes, 1);
+    } finally { await f.s.stop(); await f.tmp.cleanup(); }
+  });
+}
+
+test("missing reply contact stays needs-operator and cannot create a contact", async () => {
+  const f = await externalJob("bob", false);
+  try {
+    await f.s.stop(); const before = await snapshotInputs(f.tmp.path);
+    await assert.rejects(f.service().prepare(f.pending.id, f.selected));
+    assert.equal((await f.service().jobs())[0]!.replyDestination, "needs-operator");
+    assert.deepEqual(await snapshotInputs(f.tmp.path), before); assert.equal(f.transport.writes, 0);
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+for (const mutation of ["contact", "payload", "work-scope"] as const) {
+  test(`${mutation} mutation invalidates external response authority before nonce reservation`, async () => {
+    const f = await externalJob();
+    try {
+      await f.s.stop(); const reply = await f.service().prepare(f.pending.id, f.selected); assert.ok(reply.actionHash);
+      await f.service().authorize(reply.effectId, reply.actionHash);
+      const stateStores = createStores(f.directory), before = await stateStores.nonces.last(f.policy.members.find(m => m.alias === "bob")!.did, f.mailbox.room);
+      if (mutation === "contact") {
+        const other = await f.stores.mailboxes.create("alternativefixture", externalDid);
+        await f.stores.contacts.add("bob", "externalfixture", externalDid, other.room);
+      } else if (mutation === "payload") {
+        const path = resolve(f.directory, "external-deliveries", `${reply.effectId}.json`);
+        const r = JSON.parse(await readFile(path, "utf8")); r.envelope.output = { changed: true }; await atomicWriteJson(path, r);
+      } else {
+        const path = resolve(f.directory, "session.json"), r = JSON.parse(await readFile(path, "utf8"));
+        r.jobs[f.s.snapshot().tasks[f.root]!.jobId].root.operatorScope.maxTasks = 99; await atomicWriteJson(path, r);
+      }
+      await assert.rejects(f.service().send(reply.effectId, reply.actionHash));
+      assert.equal(f.transport.writes, 0);
+      assert.equal(await stateStores.nonces.last(f.policy.members.find(m => m.alias === "bob")!.did, f.mailbox.room), before);
+    } finally { await f.s.stop(); await f.tmp.cleanup(); }
+  });
+}
+
+test("external duplicate intake cannot create a second job/compute/response; changed replay revokes further work", async () => {
+  const f = await externalJob();
+  try {
+    const ledger = await f.ledger();
+    await f.enqueueExternal(); await f.s.receive("bob"); await untilIdle(f.s);
+    assert.equal(Object.keys(f.s.snapshot().jobs).length, 1); assert.equal(await f.ledger(), ledger);
+    const changed = { ...f.p, objective: "Changed content under the same identifier" };
+    await f.enqueueExternal(changed); await f.s.receive("bob");
+    assert.equal(f.s.snapshot().proposals[f.pending.id]!.status, "rejected");
+    await f.s.stop(); await assert.rejects(f.service().prepare(f.pending.id, f.selected));
+    assert.equal(Object.keys(f.s.snapshot().jobs).length, 1); assert.equal(await f.ledger(), ledger);
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+test("external status CLI and restart inspection do not unlock, rerun, mutate state or disclose capabilities", async () => {
+  const f = await externalJob();
+  try {
+    await f.s.stop(); const reply = await f.service().prepare(f.pending.id, f.selected);
+    const path = resolve(f.directory, "external-deliveries", `${reply.effectId}.json`);
+    const r = JSON.parse(await readFile(path, "utf8")); r.status = "sending"; r.postAttempts = 1; r.nonce = "1";
+    await atomicWriteJson(path, r); const before = await readFile(path, "utf8"), ledger = await f.ledger();
+    const service = new ExternalJobDelivery({ root: f.tmp.path, sessionId: f.policy.sessionId, passphrases: async () => { throw new Error("Must not unlock"); } });
+    assert.equal((await service.inspect(reply.effectId)).delivery, "delivery-ambiguous");
+    const output = execFileSync(process.execPath, [resolve("dist/src/cli.js"), "external:response-status", f.policy.sessionId, reply.effectId],
+      { encoding: "utf8", env: { ...process.env, TECHNOCORE_HOME: f.tmp.path } });
+    assert.equal(JSON.parse(output).compute, "completed"); assert.equal(output.includes(f.mailbox.room), false);
+    for (const forbidden of ["encryptedPrivateKey", "privateKey", "passphrase", '"sig"', '"signature"']) assert.equal(output.includes(forbidden), false);
+    assert.equal(await readFile(path, "utf8"), before); assert.equal(await f.ledger(), ledger); assert.equal(f.transport.writes, 0);
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+for (const mutation of ["contact", "approval"] as const) {
+  test(`external ${mutation} mutation after nonce reservation blocks dispatch without reclaiming the nonce`, async () => {
+    const f = await externalJob(), reserve = NonceStore.prototype.reserve;
+    try {
+      await f.s.stop(); const ledger = await f.ledger();
+      const reply = await f.service().prepare(f.pending.id, f.selected); assert.ok(reply.actionHash); assert.ok(reply.actionId);
+      await f.service().authorize(reply.effectId, reply.actionHash);
+      NonceStore.prototype.reserve = async function (did, room) {
+        const nonce = await reserve.call(this, did, room);
+        if (mutation === "contact") {
+          const alternative = await f.stores.mailboxes.load("eve");
+          await f.stores.contacts.add("bob", "externalfixture", externalDid, alternative.room);
+        } else {
+          await new ActionApprovalStore(resolve(f.directory, "external-response-approvals")).finish("bob", reply.actionId!, "failed");
+        }
+        return nonce;
+      };
+      await f.service().send(reply.effectId, reply.actionHash);
+      assert.equal(f.transport.writes, 0);
+      const nonces = createStores(f.directory).nonces;
+      const nonce = await nonces.last(f.policy.members.find(m => m.alias === "bob")!.did, f.mailbox.room);
+      assert.ok(nonce);
+      await assert.rejects(f.service().send(reply.effectId, reply.actionHash));
+      assert.equal(await nonces.last(f.policy.members.find(m => m.alias === "bob")!.did, f.mailbox.room), nonce);
+      assert.equal(await f.ledger(), ledger);
+      assert.equal(f.s.snapshot().tasks[f.selected]!.compute, "result-ready");
+    } finally { NonceStore.prototype.reserve = reserve; await f.s.stop(); await f.tmp.cleanup(); }
+  });
+}
+
+test("bounded external envelope refuses oversize output without delivery or new inference", async () => {
+  const f = await externalJob("bob", true, false, { payloadBytes: 1024 });
+  try {
+    await f.s.stop(); const ledger = await f.ledger();
+    await assert.rejects(f.service().prepare(f.pending.id, f.selected));
+    assert.equal(f.transport.writes, 0); assert.equal(await f.ledger(), ledger);
+    assert.equal(f.s.snapshot().tasks[f.selected]!.compute, "result-ready");
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+test("crash after exact approval consumption cannot mint replacement response authority", async () => {
+  const f = await externalJob();
+  try {
+    await f.s.stop(); const reply = await f.service().prepare(f.pending.id, f.selected); assert.ok(reply.actionHash); assert.ok(reply.actionId);
+    await f.service().authorize(reply.effectId, reply.actionHash);
+    const approvals = new ActionApprovalStore(resolve(f.directory, "external-response-approvals"));
+    const action = await approvals.read("bob", reply.actionId);
+    await approvals.consume(action, action.actionId); // Simulated process death before nonce reservation.
+    const ledger = await f.ledger();
+    await f.service().prepare(f.pending.id, f.selected);
+    await assert.rejects(f.service().authorize(reply.effectId, reply.actionHash));
+    await assert.rejects(f.service().send(reply.effectId, reply.actionHash));
+    assert.equal((await approvals.read("bob", reply.actionId)).status, "executing");
+    assert.equal(f.transport.writes, 0); assert.equal(await f.ledger(), ledger);
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
+});
+
+test("an external response consumes remaining shared POST budget and refuses an exhausted budget", async () => {
+  const f = await externalJob();
+  try {
+    await f.s.stop(); const path = resolve(f.directory, "session.json");
+    const snapshot = JSON.parse(await readFile(path, "utf8"));
+    snapshot.budgets.outbound = snapshot.policy.limits.outbound; // Retained usage from prior simulated effects.
+    await atomicWriteJson(path, snapshot); const checkpoint = await readFile(path, "utf8"), ledger = await f.ledger();
+    const reply = await f.service().prepare(f.pending.id, f.selected); assert.ok(reply.actionHash);
+    await f.service().authorize(reply.effectId, reply.actionHash);
+    const result = await f.service().send(reply.effectId, reply.actionHash);
+    assert.equal(result.compute, "completed"); assert.equal(result.postAttempts, 0); assert.equal(f.transport.writes, 0);
+    assert.equal(await f.ledger(), ledger); assert.equal(await readFile(path, "utf8"), checkpoint);
+  } finally { await f.s.stop(); await f.tmp.cleanup(); }
 });

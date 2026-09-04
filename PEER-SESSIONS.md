@@ -203,6 +203,16 @@ retain its own computation/resources, since the provider interface has no cancel
 method. Node `KeyObject` reference release does not guarantee immediate physical
 memory zeroization. Passphrases never use argv or logs.
 
+## External result delivery
+
+After an approved external job completes and the session is cleanly stopped,
+`ExternalJobDelivery` can prepare a response from the existing task/memory/evidence
+and inference ledger. A separate exact response approval is required; work approval
+never grants it. Bob -> Dave -> Bob can reply directly to the external requester
+with dependency evidence and immutable external provenance. No runtime resume or
+legacy workload re-execution is used. See [EXTERNAL-JOBS.md](EXTERNAL-JOBS.md) for
+the commands, existing-contact requirement and conservative delivery recovery.
+
 ## Validation
 
 Peer inference now uses a shared session ledger with DID/job sub-budgets and

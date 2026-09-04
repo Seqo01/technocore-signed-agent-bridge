@@ -224,6 +224,16 @@ Agent v1 has a separate, explicit workload layer for useful offline work before 
 
 The end-to-end test creates temporary encrypted identities and runs Research, Engineering and Collaboration in three runtime sessions. It verifies the same DID binding, memory reuse after restart, persist-before-ack inbox behavior and zero automatic collaboration sends. See [WORKLOADS.md](WORKLOADS.md) for the contracts and boundaries.
 
+## External job completion
+
+An operator-approved external job can reuse its completed peer task and evidence
+to prepare a direct signed response from Bob, Charlie, Dave or Eve to the requester,
+without an Alice relay. Result delivery has a separate exact-action approval and
+durable effect state; failed or ambiguous sends do not rerun the computation.
+This one-shot path requires a cleanly stopped session and an unchanged requester
+contact captured at intake. See [EXTERNAL-JOBS.md](EXTERNAL-JOBS.md) for the bounded
+result envelope, CLI/host API, delegation evidence and live-use prerequisites.
+
 ## Current limitations
 
 Inference attempts now have host-bound DID/session/job accounting and pre-dispatch

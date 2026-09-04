@@ -16,7 +16,7 @@ export function validatePeerWindow(view: RoomResponse, since: number): void {
   if (previous !== view.last_seq) throw new BridgeError("Mailbox window incomplete; no backlog crawl");
   if ((view.count > 0 && view.first_seq === null) || (view.last_seq === 0 && view.first_seq !== null)) throw new BridgeError("Invalid first sequence metadata");
 }
-export function classifyEffectObservation(effect: PeerEffect, senderDid: string, view: RoomResponse): {
+export function classifyEffectObservation(effect: Pick<PeerEffect, "id" | "nonce" | "payloadHash">, senderDid: string, view: RoomResponse): {
   effectId: string; observation: "observed" | "not-observed" | "incomplete"; decision: "needs-operator"; seq?: number;
 } {
   try { validatePeerWindow(view, 0); } catch { return { effectId: effect.id, observation: "incomplete", decision: "needs-operator" }; }

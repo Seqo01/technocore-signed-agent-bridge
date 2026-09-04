@@ -2,7 +2,7 @@ import { AmbiguousSendError, BridgeError } from "../errors.js";
 import { resolve } from "node:path";
 import { ApprovalRequiredError, type ActionApproval } from "./approvals.js";
 import { AgentRoleStore, assertRoleWorkload, type AgentRole } from "./roles.js";
-import { validateEvidence, type TaskEvidence } from "./evidence.js";
+import { readCompletedTaskEvidence, type TaskEvidence } from "./evidence.js";
 import { SignedAgentBridge, type BridgeStores, type InboxPeekResult } from "../bridge.js";
 import { createStores } from "../context.js";
 import { roomClasses } from "../names.js";
@@ -15,7 +15,7 @@ import {
   type WorkloadRegistry,
 } from "../workloads/registry.js";
 import { ActivityJournal } from "./journal.js";
-import { AccountedInferenceProvider, defaultInferenceBudgets, type InferenceAccountingOptions, type InferenceBinding } from "./inference-accounting.js";
+import { AccountedInferenceProvider, defaultInferenceBudgets, type InferenceAccountingOptions } from "./inference-accounting.js";
 import { LocalMemoryProvider } from "./memory.js";
 import { agentPaths, type AgentPaths } from "./paths.js";
 import { AgentRuntimeLock } from "./runtime-lock.js";
@@ -288,41 +288,15 @@ export class AgentRuntime {
 
   async exportTaskEvidence(taskId: string): Promise<TaskEvidence> {
     this.assertOpen();
-    const state = await this.state.load();
-    if (state.profile.did !== this.did || state.profile.identityAlias !== this.identityAlias) {
-      throw new BridgeError("Profile binding changed");
-    }
-    const task = state.tasks[taskId];
-    if (!task || task.status !== "succeeded" || !task.type.startsWith("workload.") || !task.result?.reference) {
-      throw new BridgeError("Only a completed workload can export evidence");
-    }
-    const record = await this.memory.get(task.result.reference);
-    const value = record?.value as { workload: unknown; output: unknown; actions: unknown; inferenceEvidence: {
-      requestId: string; requestHash: string; resultHash: string; accounting?: InferenceBinding } } | undefined;
-    const journal = (await this.journal.read()).find(entry => entry.taskId === taskId && entry.resultHash === task.result!.hash);
-    const durable = task.result.evidence;
-    const memoryWriteHashes = durable?.memoryWriteHashes ?? journal?.memoryWriteHashes;
-    if (!value?.inferenceEvidence || !memoryWriteHashes || task.result.hash !== hashValue({
-      workload: value.workload, output: value.output, actions: value.actions,
-      inferenceRequestHash: value.inferenceEvidence.requestHash,
-      inferenceResultHash: value.inferenceEvidence.resultHash, memoryWriteHashes,
-      ...(value.inferenceEvidence.accounting ? { accounting: value.inferenceEvidence.accounting } : {}),
-    })) throw new BridgeError("Incomplete or changed workload evidence");
-    if (!journal && durable) {
+    const { task, evidence, journalMissing } = await readCompletedTaskEvidence(this, this.identityAlias, this.did, taskId);
+    const durable = task.result!.evidence;
+    if (journalMissing && durable) {
       // Recover a crash after durable completion but before the final journal append, without re-running inference.
-      await this.appendJournal({ id: `evt_${hashValue({ taskId, resultHash: task.result.hash, recovered: true })}`,
+      await this.appendJournal({ id: `evt_${hashValue({ taskId, resultHash: task.result!.hash, recovered: true })}`,
         taskId, taskType: task.type, event: "workload-evidence-recovered", outcome: "success",
-        resultHash: task.result.hash, ...durable });
+        resultHash: task.result!.hash, ...durable });
     }
-    return validateEvidence({ mode: "explicit-only", evidence: [{
-      agentAlias: this.identityAlias, did: this.did, taskId, workload: task.type,
-      resultHash: task.result.hash, outputHash: hashValue(value.output), output: value.output,
-      inferenceRequestId: value.inferenceEvidence.requestId,
-      inferenceRequestHash: value.inferenceEvidence.requestHash,
-      inferenceResultHash: value.inferenceEvidence.resultHash,
-      memoryWriteHashes,
-      ...(value.inferenceEvidence.accounting ? { accounting: value.inferenceEvidence.accounting } : {}),
-    }] }).evidence[0]!;
+    return evidence;
   }
 
   async tick(): Promise<RuntimeRunResult> {

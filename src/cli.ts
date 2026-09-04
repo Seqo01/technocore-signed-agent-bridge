@@ -20,11 +20,14 @@ import { FirstReceiptReconciliation } from "./rehearsal/reconciliation.js";
 import { SendReconciliation } from "./rehearsal/send-reconciliation.js";
 import { peerSessionCommand } from "./swarm/cli.js";
 import { InferenceLedger } from "./agent/inference-accounting.js";
+import { ExternalJobDelivery } from "./swarm/external-delivery.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
     "inference:usage <ledger-file> [--session <id>] [--did <public-did>] | " +
+    "external:jobs <session> | external:response-prepare <session> <proposal-record> <result-node> | " +
+    "external:response-status <session> <effect> | external:response-authorize <session> <effect> <action-hash> | external:response-send <session> <effect> <action-hash> | " +
     "swarm:start --offline --policy <file> --policy-hash <hash> | swarm:status <id> | swarm:stop <id> | " +
     "peer:capabilities <alias> --policy <file> --policy-hash <hash> | peer:submit <alias> <file> --session <id> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
@@ -67,6 +70,15 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
+  if (["external:jobs", "external:response-prepare", "external:response-status", "external:response-authorize", "external:response-send"].includes(command)) {
+    const count = command === "external:jobs" ? 1 : command === "external:response-status" ? 2 : 3;
+    if (args.length !== count) usage();
+    const service = new ExternalJobDelivery({ root: createStores().paths.root, sessionId: requireArg(args, 0), passphrases: hiddenPassphraseProvider });
+    const result = command === "external:jobs" ? await service.jobs() : command === "external:response-prepare" ? await service.prepare(requireArg(args, 1), requireArg(args, 2)) :
+      command === "external:response-status" ? await service.inspect(requireArg(args, 1)) : command === "external:response-authorize" ? await service.authorize(requireArg(args, 1), requireArg(args, 2)) :
+        await service.send(requireArg(args, 1), requireArg(args, 2));
+    console.log(JSON.stringify(result, null, 2)); return;
+  }
   if (command === "inference:usage") {
     if (!args[0] || args.length % 2 !== 1) usage();
     const filter: { sessionId?: string; agentDid?: string } = {};

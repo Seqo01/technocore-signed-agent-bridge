@@ -175,6 +175,7 @@ export class SwarmSessionSupervisor {
       node.authorityChain[0] !== this.authority.hash) throw new BridgeError("Job provenance/input/authority binding changed");
     this.authority.workload(this.authority.member(node.alias).did, node.workload);
     if (job.root.origin === "external" && (!job.root.operatorScope || !job.root.operatorScope.workloads.includes(node.workload) || job.tasks.length > job.root.operatorScope.maxTasks)) throw new BridgeError("External job requires exact bounded operator scope");
+    if (job.root.origin === "external" && !Object.values(this.data.proposals).some(p => p.jobId === job.id && p.status === "accepted")) throw new BridgeError("External proposal authority is not active");
     if (node.parentId) {
       const parent = this.data.tasks[node.parentId]!;
       this.authority.delegate(this.authority.member(parent.alias).did, this.authority.member(node.alias).did, node.workload, node.depth, job.root);
@@ -381,9 +382,11 @@ export class SwarmSessionSupervisor {
       if (old && old.version === 1 && old.kind === undefined && Object.keys(old).every(k => ["version", "id", "from", "workload", "payload"].includes(k))) {
         if (old.from !== sender || typeof old.workload !== "string") throw new BridgeError("Legacy external sender mismatch");
         const payload = validateWorkRequest(old.workload, old.payload as Record<string, unknown>);
+        // Legacy messages have no timestamp: retransmission must preserve the first adapted timestamp.
+        const previous = this.data.proposals[hashValue({ alias, sender, proposalId: old.id })];
         parsed = { version: 1, kind: "peer-work", proposalId: old.id, requesterDid: sender, recipientDid: this.authority.member(alias).did,
           workloadType: old.workload, workloadVersion: 1, objective: "Legacy bounded external work proposal", input: payload, inputHash: hashValue(payload), evidenceRefs: [],
-          requestedOutputSchema: schemaId(old.workload, "output"), replyTo: sender, createdAt: inbound.createdAt, provenanceClaims: { adapter: "legacy-external-v1" } };
+          requestedOutputSchema: schemaId(old.workload, "output"), replyTo: sender, createdAt: previous?.proposal?.createdAt ?? inbound.createdAt, provenanceClaims: { adapter: "legacy-external-v1" } };
       }
       p = validateProposal(parsed, this.authority.policy.limits.payloadBytes, this.now());
       if (p.requesterDid !== sender || p.recipientDid !== this.authority.member(alias).did || p.jobId || p.parentTaskId || p.delegationId || p.evidenceRefs.length) throw new BridgeError("Unknown external scope");
@@ -391,12 +394,21 @@ export class SwarmSessionSupervisor {
     } catch { this.data.proposals[id] = rejected; return; }
     const replayKey = hashValue({ alias, sender, proposalId: p.proposalId });
     const prior = this.data.proposals[replayKey];
-    if (prior) { if (prior.hash !== hashValue(p)) this.data.proposals[id] = rejected; return; }
+    if (prior) {
+      if (prior.hash !== hashValue(p)) {
+        prior.status = "rejected";
+        if (prior.jobId) this.data.jobs[prior.jobId]!.status = "needs-operator";
+        this.data.proposals[id] = rejected;
+      }
+      return;
+    }
     const router = new ExternalTaskRouter(this.runtime(alias), this.authority.policy.members.map(m => m.did), this.originals.contacts);
     const adapted = structuredClone(inbound);
     adapted.payload.text = JSON.stringify({ version: 1, id: p.proposalId, from: sender, workload: p.workloadType, payload: p.input });
     const legacy = await router.classify(adapted);
-    this.data.proposals[replayKey] = { id: replayKey, hash: hashValue(p), proposal: p, trust: "external", status: legacy.status === "rejected" ? "rejected" : "needs-operator", legacyId: legacy.id };
+    const contact = await this.originals.contacts.findByDid(alias, sender);
+    this.data.proposals[replayKey] = { id: replayKey, hash: hashValue(p), proposal: p, trust: "external", status: legacy.status === "rejected" ? "rejected" : "needs-operator", legacyId: legacy.id,
+      ...(contact ? { replyContact: { contactId: contact.contactId, destinationHash: hashValue({ room: contact.mailbox, did: contact.did, contactId: contact.contactId }) } } : {}) };
   }
   /** Exact local work approval; explicitly excludes all external responses and contact creation. */
   approveExternal(proposalId: string, expectedHash: string, scope: NonNullable<RootProvenance["operatorScope"]>): Promise<string> {

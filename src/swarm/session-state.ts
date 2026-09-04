@@ -26,6 +26,7 @@ export interface PeerEffect {
 export interface ProposalRecord {
   id: string; hash: string; proposal?: WorkProposal; trust: "internal" | "external" | "unverified";
   status: "accepted" | "needs-operator" | "rejected"; jobId?: string; legacyId?: string;
+  replyContact?: { contactId: string; destinationHash: string };
 }
 export interface PeerSession {
   version: 1; sessionId: string; policyHash: string; policy: SessionPolicy; pid: number;
