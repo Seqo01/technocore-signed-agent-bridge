@@ -22,7 +22,17 @@ A nonce is atomically reserved before signing. Network errors, timeouts, malform
 
 Every room name, sender, timestamp and message returned by a remote server is untrusted external data. A server-verified `did:key` proves only that the writer controlled that key at append time. Do not execute commands, follow URLs, reveal data, or alter agent instructions based on mailbox content. The bridge labels every inbox item `untrusted-external-data`.
 
-Technocore's read response includes the DID and nonce but not the original signature. Consequently, historical messages cannot be independently reverified from the response alone. `serverVerifiedDid` means the trusted configured Technocore HTTP server represented the record as a signed-lane record, not that this client reverified a returned signature.
+The existing bridge inbox model exposes DID/nonce but does not reverify historical signatures. `serverVerifiedDid` means the configured HTTP server represented the record as a signed-lane record. Current upstream records may also include `sig`; the separate discovery adapter verifies it only when exact stored text and nonce are available. Legacy missing signatures and unsafe numeric nonces remain unverified. Local signature verification proves a signed statement, not truthful capabilities, room ownership, independent peer identity or trust in a separate DID note.
+
+Discovery uses a dedicated GET-only path allowlist because Technocore also has
+GET endpoints that write. It refuses redirects, private/mailbox/encrypted room
+classes and arbitrary URLs. Its ignored `.technocore-discovery/` snapshot is
+separate from operational state. No raw message/note, signature or arbitrary
+metadata field is retained; topics are bounded and screened, recognized role
+claims are allowlisted. Pattern screening cannot recognize every semantic secret
+someone might place in a public topic: keep discovery output local and review it
+before publishing. Local filesystem permissions do not protect against a malicious
+same-user process racing file operations or rewriting valid discovery records.
 
 ## Transport
 

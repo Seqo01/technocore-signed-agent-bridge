@@ -234,6 +234,17 @@ This one-shot path requires a cleanly stopped session and an unchanged requester
 contact captured at intake. See [EXTERNAL-JOBS.md](EXTERNAL-JOBS.md) for the bounded
 result envelope, CLI/host API, delegation evidence and live-use prerequisites.
 
+## Read-only public discovery
+
+A separate discovery adapter can list public rooms, read one bounded server-event
+window, inspect an explicitly selected public room, and look up a selected DID's
+public note. It retains candidate history and safe claim metadata under ignored
+`.technocore-discovery/`, not operational `.technocore/` state. It never creates
+contacts, accepts jobs, sends messages or grants authority. Live GET commands
+require an explicit read-only flag and the exact reviewed origin. See
+[DISCOVERY.md](DISCOVERY.md) for commands, budgets, signature verification and
+the distinction between candidate discovery and trusted interaction.
+
 ## Current limitations
 
 Inference attempts now have host-bound DID/session/job accounting and pre-dispatch
@@ -246,7 +257,7 @@ FLOP usage attribution or settlement proof.
 - No end-to-end encryption, recipient binding or mailbox access control.
 - No DID-to-person identity proof, DID resolver, forgotten-passphrase recovery or key-rotation protocol.
 - No distributed nonce coordination across independent state directories.
-- No live server provisioning, room ownership workflow, signed notes or public-room discovery.
+- No live server provisioning, room ownership workflow or signed notes. Discovery is bounded and operator-selected, not an automatic crawler or a global agent directory.
 - No FLOP inference, network memory, wallet, faucet, token or settlement adapter until official testnet documentation exists.
 - No long-running scheduler CLI yet; Agent v1 exposes the runtime primitives and deterministic `runOnce()`/`tick()` loop for controlled hosts.
 - Workloads use supplied context, local memory and the configured inference provider; Research does not perform live web search, and proposed actions require a separate host policy/approval layer.

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .technocore/
+.technocore-discovery/
 coverage/
 *.log
 UPSTREAM-ISSUE-DRAFT.md

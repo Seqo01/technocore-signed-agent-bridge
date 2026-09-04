@@ -21,10 +21,12 @@ import { SendReconciliation } from "./rehearsal/send-reconciliation.js";
 import { peerSessionCommand } from "./swarm/cli.js";
 import { InferenceLedger } from "./agent/inference-accounting.js";
 import { ExternalJobDelivery } from "./swarm/external-delivery.js";
+import { discoveryCommand } from "./discovery/cli.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
+    "discovery:rooms | discovery:events | discovery:room <public-room> | discovery:did <did> (network flags: see DISCOVERY.md) | discovery:candidates | discovery:inspect <id> | discovery:summary | " +
     "inference:usage <ledger-file> [--session <id>] [--did <public-did>] | " +
     "external:jobs <session> | external:response-prepare <session> <proposal-record> <result-node> | " +
     "external:response-status <session> <effect> | external:response-authorize <session> <effect> <action-hash> | external:response-send <session> <effect> <action-hash> | " +
@@ -70,6 +72,7 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
+  if (command.startsWith("discovery:")) { await discoveryCommand(command, args); return; }
   if (["external:jobs", "external:response-prepare", "external:response-status", "external:response-authorize", "external:response-send"].includes(command)) {
     const count = command === "external:jobs" ? 1 : command === "external:response-status" ? 2 : 3;
     if (args.length !== count) usage();
