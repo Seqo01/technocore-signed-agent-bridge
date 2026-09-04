@@ -123,6 +123,13 @@ export interface InferenceMetadata {
   model: string;
   providerSessionId?: string;
   providerResultId?: string;
+  providerRequestId?: string;
+  providerMode?: "offline" | "configured";
+  usageStatus?: "unknown" | "synthetic" | "provider-reported";
+  spendStatus?: "unknown" | "provider-reported";
+  /** Adapter-reported billing lifecycle, not proof of settlement. */
+  billingStatus?: "unknown" | "pending" | "final";
+  accounting?: import("./inference-accounting.js").InferenceBinding;
   latencyMs?: number;
   usage?: Record<string, string>;
   spend?: SpendMetadata;
@@ -133,6 +140,7 @@ export interface InferenceRequest {
   taskId: string;
   taskType: string;
   input: unknown;
+  readonly executionContext?: import("./inference-accounting.js").InferenceExecutionContext;
 }
 
 export type InferenceResult =
@@ -155,6 +163,15 @@ export type InferenceResult =
 
 export interface InferenceProvider {
   readonly name: string;
+  /** Declarative adapter boundary only. The runtime does not perform status lookups. */
+  readonly accountingSupport?: {
+    readonly usageUnits?: readonly string[];
+    readonly reportsSpend?: boolean;
+    readonly reportsBillingStatus?: boolean;
+    readonly canLookupOutcome?: boolean;
+  };
+  /** Optional trusted-host preparation; never called on a model-provided object. */
+  prepare?(request: InferenceRequest): InferenceRequest;
   infer(request: InferenceRequest): Promise<InferenceResult>;
 }
 

@@ -3,6 +3,7 @@ import { didToPublicKeyBytes } from "../protocol.js";
 import { hashValue } from "../agent/util.js";
 import { ROLE_WORKLOADS, type AgentRole } from "../agent/roles.js";
 import { assertLocalAlias } from "../names.js";
+import { validateInferenceBudgets, type InferenceBudgets } from "../agent/inference-accounting.js";
 
 export const PEER_ROLES = { alice: "coordinator", bob: "researcher", charlie: "engineer", dave: "reviewer", eve: "specialist" } as const;
 export type PeerAlias = keyof typeof PEER_ROLES;
@@ -18,6 +19,7 @@ export interface SessionPolicy {
   version: 1; sessionId: string; mode: ProviderMode; members: PeerMember[]; pairs: PeerPair[];
   schemas: ["peer-work/v1", "peer-result/v1"]; workloads: { type: string; version: 1 }[];
   limits: SessionLimits; expiresAt: string;
+  inferenceBudgets?: InferenceBudgets;
   intake?: { aliases: PeerAlias[]; intervalMs: number; maxRounds: number };
   network: { origin: "offline" | "https://technocore.chat"; pathClass: "signed-mailbox-only"; postRetries: 0 };
 }
@@ -67,6 +69,7 @@ export class SessionAuthority {
     this.hash = hashValue(this.policy);
     if (this.hash !== reviewedHash) throw new BridgeError("Reviewed session policy hash mismatch");
     const p = this.policy;
+    if (p.inferenceBudgets) validateInferenceBudgets(p.inferenceBudgets);
     assertSessionId(p.sessionId);
     if (p.version !== 1 || !["offline", "configured"].includes(p.mode) || p.members.length !== 5 ||
       new Set(p.members.map(m => m.did)).size !== 5 || new Set(p.members.map(m => m.alias)).size !== 5 ||

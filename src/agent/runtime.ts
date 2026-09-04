@@ -15,6 +15,7 @@ import {
   type WorkloadRegistry,
 } from "../workloads/registry.js";
 import { ActivityJournal } from "./journal.js";
+import { AccountedInferenceProvider, defaultInferenceBudgets, type InferenceAccountingOptions, type InferenceBinding } from "./inference-accounting.js";
 import { LocalMemoryProvider } from "./memory.js";
 import { agentPaths, type AgentPaths } from "./paths.js";
 import { AgentRuntimeLock } from "./runtime-lock.js";
@@ -104,6 +105,7 @@ export interface AgentRuntimeStartOptions {
   journal?: ActivityJournal;
   memory?: MemoryProvider;
   workloads?: WorkloadRegistry;
+  inferenceAccounting?: InferenceAccountingOptions;
 }
 
 function requiredString(payload: Record<string, unknown>, key: string, maximum = 16_384): string {
@@ -138,7 +140,7 @@ export class AgentRuntime {
     state: AgentStateStore,
     journal: ActivityJournal,
     memory: MemoryProvider,
-    private readonly inference: InferenceProvider,
+    private inference: InferenceProvider,
     private readonly lock: AgentRuntimeLock,
     unlockedIdentity: UnlockedIdentity,
     sessionId: string,
@@ -148,6 +150,7 @@ export class AgentRuntime {
     private readonly handlesSignals: boolean,
     workloads: WorkloadRegistry,
     readonly role: AgentRole | undefined,
+    accounting: InferenceAccountingOptions | undefined,
   ) {
     this.identityAlias = identityAlias;
     this.paths = paths;
@@ -157,7 +160,16 @@ export class AgentRuntime {
     this.unlockedIdentity = unlockedIdentity;
     this.sessionId = sessionId;
     this.bridge = transport ? new SignedAgentBridge(stores, transport) : undefined;
-    this.workloadExecutor = new WorkloadExecutor(workloads, inference, memory, monotonicNow);
+    const accountingDid = unlockedIdentity.did;
+    this.inference = new AccountedInferenceProvider(inference, accounting ?? {
+      path: resolve(paths.directory, "inference", `${sessionId}.json`), budgets: defaultInferenceBudgets(),
+      context: request => ({ agentDid: accountingDid, sessionId, jobId: request.taskId, taskId: request.taskId,
+        rootRequesterDid: accountingDid, rootOrigin: "internal", rootTrust: "operator-local", workloadType: request.taskType,
+        workloadVersion: request.taskType.startsWith("workload.") ? workloads.require(request.taskType).version : 1,
+        authorityId: hashValue({ did: accountingDid, sessionId, scope: "local-runtime-inference" }),
+        providerMode: ["deterministic-local", "operator-supplied"].includes(inference.name) ? "offline" : "configured" }),
+    });
+    this.workloadExecutor = new WorkloadExecutor(workloads, this.inference, memory, monotonicNow);
     if (handlesSignals) {
       process.once("SIGINT", this.signalHandler);
       process.once("SIGTERM", this.signalHandler);
@@ -216,6 +228,7 @@ export class AgentRuntime {
         options.handleSignals ?? true,
         options.workloads ?? createDefaultWorkloadRegistry(),
         role,
+        options.inferenceAccounting,
       );
     } catch (error) {
       unlocked = undefined;
@@ -285,7 +298,7 @@ export class AgentRuntime {
     }
     const record = await this.memory.get(task.result.reference);
     const value = record?.value as { workload: unknown; output: unknown; actions: unknown; inferenceEvidence: {
-      requestId: string; requestHash: string; resultHash: string } } | undefined;
+      requestId: string; requestHash: string; resultHash: string; accounting?: InferenceBinding } } | undefined;
     const journal = (await this.journal.read()).find(entry => entry.taskId === taskId && entry.resultHash === task.result!.hash);
     const durable = task.result.evidence;
     const memoryWriteHashes = durable?.memoryWriteHashes ?? journal?.memoryWriteHashes;
@@ -293,6 +306,7 @@ export class AgentRuntime {
       workload: value.workload, output: value.output, actions: value.actions,
       inferenceRequestHash: value.inferenceEvidence.requestHash,
       inferenceResultHash: value.inferenceEvidence.resultHash, memoryWriteHashes,
+      ...(value.inferenceEvidence.accounting ? { accounting: value.inferenceEvidence.accounting } : {}),
     })) throw new BridgeError("Incomplete or changed workload evidence");
     if (!journal && durable) {
       // Recover a crash after durable completion but before the final journal append, without re-running inference.
@@ -307,6 +321,7 @@ export class AgentRuntime {
       inferenceRequestHash: value.inferenceEvidence.requestHash,
       inferenceResultHash: value.inferenceEvidence.resultHash,
       memoryWriteHashes,
+      ...(value.inferenceEvidence.accounting ? { accounting: value.inferenceEvidence.accounting } : {}),
     }] }).evidence[0]!;
   }
 

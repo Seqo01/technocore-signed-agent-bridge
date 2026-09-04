@@ -12,6 +12,7 @@ import type {
   SpendMetadata,
 } from "./types.js";
 import { assertDecimalString } from "./util.js";
+import { cleanInferenceBinding } from "./inference-accounting.js";
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -44,6 +45,12 @@ function validateInference(metadata: InferenceMetadata): InferenceMetadata {
   return {
     provider: metadata.provider,
     model: metadata.model,
+    ...(metadata.accounting ? { accounting: cleanInferenceBinding(metadata.accounting) } : {}),
+    ...(metadata.providerMode ? { providerMode: metadata.providerMode } : {}),
+    ...(metadata.usageStatus ? { usageStatus: metadata.usageStatus } : {}),
+    ...(metadata.spendStatus ? { spendStatus: metadata.spendStatus } : {}),
+    ...(metadata.billingStatus ? { billingStatus: metadata.billingStatus } : {}),
+    ...(metadata.providerRequestId ? { providerRequestId: validateSafeId(metadata.providerRequestId, "provider request id") } : {}),
     ...(metadata.providerSessionId
       ? { providerSessionId: validateSafeId(metadata.providerSessionId, "provider session id") }
       : {}),

@@ -81,7 +81,7 @@ export class WorkloadExecutor {
       };
     }
 
-    const request = {
+    const rawRequest = {
       requestId: inferenceRequestId,
       taskId: task.id,
       taskType: task.type,
@@ -90,6 +90,7 @@ export class WorkloadExecutor {
         plan: structuredClone(plan.input),
       },
     };
+    const request = this.inference.prepare?.(rawRequest) ?? rawRequest;
     const inferenceRequestHash = hashValue(request);
     await hooks.beforeInference?.();
     const started = this.monotonicNow();
@@ -163,6 +164,7 @@ export class WorkloadExecutor {
           requestId: inferenceRequestId,
           requestHash: inferenceRequestHash,
           resultHash: inferenceResultHash,
+          ...(metadata.accounting ? { accounting: metadata.accounting } : {}),
         },
         output,
         actions,
@@ -187,6 +189,7 @@ export class WorkloadExecutor {
       inferenceRequestHash,
       inferenceResultHash,
       memoryWriteHashes,
+      ...(metadata.accounting ? { accounting: metadata.accounting } : {}),
     });
     return {
       outcome: "success",

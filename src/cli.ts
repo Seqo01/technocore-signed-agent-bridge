@@ -19,10 +19,12 @@ import { ALIASES, type Alias } from "./rehearsal/setup.js";
 import { FirstReceiptReconciliation } from "./rehearsal/reconciliation.js";
 import { SendReconciliation } from "./rehearsal/send-reconciliation.js";
 import { peerSessionCommand } from "./swarm/cli.js";
+import { InferenceLedger } from "./agent/inference-accounting.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
+    "inference:usage <ledger-file> [--session <id>] [--did <public-did>] | " +
     "swarm:start --offline --policy <file> --policy-hash <hash> | swarm:status <id> | swarm:stop <id> | " +
     "peer:capabilities <alias> --policy <file> --policy-hash <hash> | peer:submit <alias> <file> --session <id> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
@@ -65,6 +67,16 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
+  if (command === "inference:usage") {
+    if (!args[0] || args.length % 2 !== 1) usage();
+    const filter: { sessionId?: string; agentDid?: string } = {};
+    for (let i = 1; i < args.length; i += 2) {
+      if (args[i] === "--session" && !filter.sessionId) filter.sessionId = requireArg(args, i + 1);
+      else if (args[i] === "--did" && !filter.agentDid) filter.agentDid = requireArg(args, i + 1);
+      else usage();
+    }
+    console.log(JSON.stringify(await new InferenceLedger(resolve(args[0])).summary(filter), null, 2)); return;
+  }
   if (["swarm:start", "swarm:status", "swarm:stop", "peer:capabilities", "peer:submit"].includes(command)) {
     await peerSessionCommand(command, args); return;
   }

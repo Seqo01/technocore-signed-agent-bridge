@@ -205,6 +205,13 @@ memory zeroization. Passphrases never use argv or logs.
 
 ## Validation
 
+Peer inference now uses a shared session ledger with DID/job sub-budgets and
+host-created root provenance. Optional `inferenceBudgets` is bound by the reviewed
+policy hash; no model or proposal can override it. See
+[INFERENCE-ACCOUNTING.md](INFERENCE-ACCOUNTING.md) for reservations, safe inspection,
+offline labels and unresolved-cost behavior. Existing session message authorities
+and historical rehearsal/reconciliation records are not migrated.
+
 ```powershell
 npm.cmd test
 npm.cmd run typecheck

@@ -19,6 +19,7 @@ import { offlinePeerInference } from "../src/swarm/offline-inference.js";
 import { PeerEffectReconciliation } from "../src/swarm/effect-reconciliation.js";
 import { peerSessionCommand } from "../src/swarm/cli.js";
 import { DeterministicInferenceProvider } from "../src/agent/inference.js";
+import { InferenceLedger, defaultInferenceBudgets } from "../src/agent/inference-accounting.js";
 import { InMemoryTechnocoreTransport } from "../src/mock-transport.js";
 import { SignedPostRejectedError } from "../src/send-diagnostics.js";
 import { AmbiguousSendError } from "../src/errors.js";
@@ -150,6 +151,20 @@ for (const [source, target] of [["bob", "dave"], ["dave", "bob"], ["charlie", "b
       assert.equal(state.budgets.outbound, 2); assert.equal(state.budgets.gets, 2); assert.equal(state.budgets.inference, 2);
       assert.equal(Object.values(state.effects).every(e => e.status === "received"), true);
       assert.equal(Object.values(state.jobs)[0]!.status, "completed");
+      const attempts = await new InferenceLedger(resolve(sessionDirectory(f.tmp.path, f.policy.sessionId), "inference-usage.json")).read();
+      assert.equal(attempts.length, 2);
+      assert.equal(new Set(attempts.map(a => a.context.agentDid)).size, 2);
+      for (const a of attempts) {
+        assert.equal(a.context.rootRequesterDid, f.policy.members.find(m => m.alias === source)!.did);
+        assert.equal(a.context.sessionId, f.policy.sessionId);
+        assert.equal(a.context.jobId, state.tasks[root]!.jobId);
+        assert.equal(a.context.authorityId, hashValue(f.policy));
+        const node = Object.values(state.tasks).find(t => t.runtimeTaskId === a.context.taskId)!;
+        assert.equal(node.evidence!.accounting!.attemptId, a.attemptId);
+        assert.equal(node.evidence!.accounting!.requestHash, node.evidence!.inferenceRequestHash);
+        assert.equal(node.evidence!.accounting!.providerMetadataHash, a.providerMetadataHash);
+        assert.equal(a.usageStatus, "synthetic"); assert.equal(a.spendStatus, "unknown");
+      }
       assert.equal(Object.values(state.receipts).every(r => r.status === "acked"), true);
       assert.equal(f.unlocks(), 5);
       if (source !== "alice" && target !== "alice") assert.equal(Object.values(state.tasks).some(t => t.alias === "alice"), false);
@@ -304,6 +319,30 @@ test("external approved Bob -> Dave retains root scope and cannot authorize exte
     assert.equal(s.snapshot().tasks[child]!.rootHash, s.snapshot().tasks[root]!.rootHash);
     await assert.rejects(s.delegate(child, "bob", "workload.research", input("workload.research")), /budget/);
     assert.throws(() => s.authority.pair(bob, externalDid, "workload.review", s.snapshot().jobs[s.snapshot().tasks[root]!.jobId]!.root), /Directional/);
+    await untilIdle(s);
+    const attempts = await new InferenceLedger(resolve(sessionDirectory(f.tmp.path, f.policy.sessionId), "inference-usage.json")).read();
+    assert.equal(attempts.length, 2);
+    for (const a of attempts) {
+      assert.equal(a.context.rootRequesterDid, externalDid);
+      assert.equal(a.context.rootOrigin, "external"); assert.equal(a.context.rootTrust, "external-approved");
+      assert.equal(a.context.jobId, s.snapshot().tasks[root]!.jobId);
+    }
+  } finally { await s.stop(); await f.tmp.cleanup(); }
+});
+
+test("reviewed inference budgets deny a child job computation without altering message authority", async () => {
+  const f = await fixture();
+  f.policy.inferenceBudgets = defaultInferenceBudgets(10); f.policy.inferenceBudgets.job.maxAttempts = 1;
+  const s = await f.start();
+  try {
+    const root = await s.submit("bob", proposal(f.policy, "bob"));
+    const child = await s.delegate(root, "dave", "workload.review", input("workload.review"));
+    await untilIdle(s);
+    assert.equal(s.snapshot().tasks[root]!.compute, "result-ready"); assert.equal(s.snapshot().tasks[child]!.compute, "failed");
+    assert.equal(s.snapshot().budgets.inference, 1);
+    const summary = await new InferenceLedger(resolve(sessionDirectory(f.tmp.path, f.policy.sessionId), "inference-usage.json")).summary();
+    assert.equal(summary.successes, 1); assert.equal(summary.cancelled, 1);
+    assert.equal(f.transport.writes, 1); // Proposal only: failed compute does not fabricate a result send.
   } finally { await s.stop(); await f.tmp.cleanup(); }
 });
 

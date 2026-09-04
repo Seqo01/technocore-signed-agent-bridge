@@ -226,6 +226,13 @@ The end-to-end test creates temporary encrypted identities and runs Research, En
 
 ## Current limitations
 
+Inference attempts now have host-bound DID/session/job accounting and pre-dispatch
+attempt/usage/spend budgets. Missing cost remains unknown, ambiguous reservations
+are held, and offline usage is explicitly synthetic. See
+[INFERENCE-ACCOUNTING.md](INFERENCE-ACCOUNTING.md) for the read-only inspection CLI,
+policy schema and official-provider limitations. This is local accounting, not
+FLOP usage attribution or settlement proof.
+
 - No end-to-end encryption, recipient binding or mailbox access control.
 - No DID-to-person identity proof, DID resolver, forgotten-passphrase recovery or key-rotation protocol.
 - No distributed nonce coordination across independent state directories.

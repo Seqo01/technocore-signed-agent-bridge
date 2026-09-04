@@ -3,6 +3,7 @@ import { assertLocalAlias } from "../names.js";
 import { didToPublicKeyBytes } from "../protocol.js";
 import { assertNoSecretLikeOutput } from "../workloads/types.js";
 import { hashValue } from "./util.js";
+import { cleanInferenceBinding, type InferenceBinding } from "./inference-accounting.js";
 
 export interface TaskEvidence {
   agentAlias: string;
@@ -16,6 +17,7 @@ export interface TaskEvidence {
   inferenceResultHash: string;
   memoryWriteHashes: string[];
   output: unknown;
+  accounting?: InferenceBinding;
 }
 
 export interface ExplicitTaskContext { mode: "explicit-only"; evidence: TaskEvidence[] }
@@ -35,6 +37,11 @@ export function validateEvidence(context: ExplicitTaskContext): ExplicitTaskCont
         ...item.memoryWriteHashes].some(hash => !/^[a-f0-9]{64}$/u.test(hash)) ||
       item.outputHash !== hashValue(item.output)) throw new BridgeError("Invalid or changed evidence snapshot");
     assertNoSecretLikeOutput(JSON.stringify(item), "Evidence snapshot");
+    if (item.accounting) {
+      const binding = cleanInferenceBinding(item.accounting);
+      if (hashValue(binding) !== hashValue(item.accounting) || binding.context.agentDid !== item.did ||
+        binding.context.taskId !== item.taskId || binding.requestHash !== item.inferenceRequestHash) throw new BridgeError("Inference evidence binding mismatch");
+    }
   }
   return structuredClone(context);
 }

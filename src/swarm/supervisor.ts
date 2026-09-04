@@ -6,7 +6,8 @@ import { AgentRoleStore } from "../agent/roles.js";
 import { agentPaths } from "../agent/paths.js";
 import { AgentRuntimeLock } from "../agent/runtime-lock.js";
 import { ActionApprovalStore, type ExactActionEffect } from "../agent/approvals.js";
-import type { InferenceProvider, InferenceResult, AgentTask } from "../agent/types.js";
+import type { InferenceProvider, AgentTask } from "../agent/types.js";
+import { defaultInferenceBudgets, type InferenceAccountingOptions } from "../agent/inference-accounting.js";
 import { hashValue } from "../agent/util.js";
 import { createStores } from "../context.js";
 import { atomicWriteJson, ensurePrivateDirectory, pathExists, readJsonFile } from "../fs-safe.js";
@@ -104,7 +105,8 @@ export class SwarmSessionSupervisor {
         await new AgentRoleStore(paths.directory).assign(identity, member.role);
         const provider = options.inference ?? offlinePeerInference();
         const runtime = await AgentRuntime.start({ identityAlias: member.alias, expectedDid: member.did, stores,
-          passphrases: options.passphrases, inference: s.inference(provider), transport: s.scopedTransport(member.alias), handleSignals: false });
+          passphrases: options.passphrases, inference: provider, inferenceAccounting: s.inferenceAccounting(member.alias),
+          transport: s.scopedTransport(member.alias), handleSignals: false });
         s.runtimes.set(member.alias, runtime);
       }
       s.router = new LocalSwarmRouter([...s.runtimes].map(([alias, runtime]) => ({ binding: { alias, expectedDid: runtime.did }, runtime })), async request => {
@@ -141,16 +143,21 @@ export class SwarmSessionSupervisor {
     if (!runtime) throw new BridgeError("Peer runtime unavailable");
     return runtime;
   }
-  private inference(provider: InferenceProvider): InferenceProvider {
-    return { name: provider.name, infer: async request => {
-      this.budget("inference"); this.data.budgets.inference++; await this.store.save();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([provider.infer(structuredClone(request)), new Promise<InferenceResult>(resolveTimeout => {
-          timer = setTimeout(() => resolveTimeout({ outcome: "ambiguous", errorCode: "PROVIDER_TIMEOUT", metadata: { provider: provider.name, model: "unknown" } }), this.authority.policy.limits.inferenceTimeoutMs);
-        })]);
-      } finally { if (timer) clearTimeout(timer); }
-    } };
+  private inferenceAccounting(alias: PeerAlias): InferenceAccountingOptions {
+    return { path: resolve(this.store.directory, "inference-usage.json"),
+      budgets: this.authority.policy.inferenceBudgets ?? defaultInferenceBudgets(this.authority.policy.limits.inference),
+      timeoutMs: this.authority.policy.limits.inferenceTimeoutMs,
+      context: request => {
+        const node = Object.values(this.data.tasks).find(t => t.alias === alias && t.runtimeTaskId === request.taskId);
+        if (!node || node.compute !== "running") throw new BridgeError("Inference requires a running host-bound DAG task");
+        this.authorizeNode(node);
+        const root = this.data.jobs[node.jobId]!.root;
+        return { agentDid: this.authority.member(alias).did, sessionId: this.data.sessionId, jobId: node.jobId,
+          taskId: request.taskId, rootRequesterDid: root.requesterDid, rootOrigin: root.origin, rootTrust: root.trust,
+          workloadType: node.workload, workloadVersion: 1, authorityId: this.authority.hash, providerMode: this.authority.policy.mode };
+      },
+      beforeDispatch: async () => { this.budget("inference"); this.data.budgets.inference++; await this.store.save(); },
+    };
   }
   private async checkDestination(source: string, target: string, contactId: string, expectedHash: string): Promise<void> {
     const member = this.authority.policy.members.find(m => m.did === source);
