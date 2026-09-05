@@ -16,6 +16,7 @@ export * from "./protocol.js";
 export * from "./redact.js";
 export * from "./transport.js";
 export * from "./swarm/outbound-external-work.js";
+export * from "./swarm/external-bootstrap.js";
 export type * from "./types.js";
 export * from "./agent/inference.js";
 export * from "./agent/journal.js";

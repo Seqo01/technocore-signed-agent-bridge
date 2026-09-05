@@ -90,6 +90,7 @@ export interface RoomResponse {
   count: number;
   first_seq: number | null;
   last_seq: number;
+  generation?: number;
   messages: RoomMessage[];
   posted?: RoomMessage;
 }

@@ -30,6 +30,15 @@ never in normal inbox/status output, and requires local `room|nonce|text`
 verification before correlation or review. Missing signatures are invalid responses.
 The exact checkpoint and job linkage are durable before cursor acknowledgement.
 
+External bootstrap is a separate quarantine, not a contact or trust store. Candidate,
+target DID and public room selection are explicit. Its request needs an exact action
+approval and is limited to one physical POST with no 429 or other automatic write
+retry. Same-room intake performs one bounded zero-retry GET and uses an isolated
+checkpoint/cursor, never a mailbox cursor. Only locally verified target-DID signatures
+can produce accepted evidence. Public response text containing a private `p-` or
+`mb-p-` capability is classified invalid without retaining that raw text or signature.
+Promotion proposals grant no authority and require operator review.
+
 Discovery uses a dedicated GET-only path allowlist because Technocore also has
 GET endpoints that write. It refuses redirects, private/mailbox/encrypted room
 classes and arbitrary URLs. Its ignored `.technocore-discovery/` snapshot is

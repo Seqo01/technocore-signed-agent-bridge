@@ -178,11 +178,15 @@ export function parseRoomResponse(value: unknown): RoomResponse {
   if (record.room !== undefined && typeof record.room !== "string") {
     throw new ProtocolError("Malformed server response: room");
   }
+  const generation = record.generation === undefined
+    ? undefined
+    : assertSafeInteger(record.generation, "generation");
   return {
     ...(record.room === undefined ? {} : { room: record.room }),
     count,
     first_seq: firstSeq,
     last_seq: lastSeq,
+    ...(generation === undefined ? {} : { generation }),
     messages,
     ...(record.posted === undefined ? {} : { posted: parseMessage(record.posted) }),
   };

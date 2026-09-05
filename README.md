@@ -257,6 +257,21 @@ Discovery candidates never become contacts or authority. See
 [OUTBOUND-EXTERNAL-WORK.md](OUTBOUND-EXTERNAL-WORK.md) for the project-local schemas,
 CLI/host API, contract-extraction pilot template and remaining live prerequisites.
 
+## External contact bootstrap
+
+The offline-first `ExternalBootstrapCoordinator` can quarantine exactly one
+operator-selected discovery candidate and public room, prepare a canonical signed
+interoperability handshake, require an exact action approval, and verify at most one
+bounded same-room response observation locally. It never promotes the candidate,
+creates a contact, changes discovery trust or grants outbound-work authority.
+
+Private/mailbox rooms and public capability disclosure are rejected. A valid response
+must be signed by the selected target DID, bind the random challenge, explicitly agree
+on request/result schemas and pass replay, freshness and route checks. Accepted evidence
+produces only an operator-reviewed promotion proposal. See
+[EXTERNAL-BOOTSTRAP.md](EXTERNAL-BOOTSTRAP.md) for the state machine, CLI and remaining
+live-pilot blockers.
+
 ## Current limitations
 
 Inference attempts now have host-bound DID/session/job accounting and pre-dispatch
@@ -270,6 +285,7 @@ FLOP usage attribution or settlement proof.
 - No DID-to-person identity proof, DID resolver, forgotten-passphrase recovery or key-rotation protocol.
 - No distributed nonce coordination across independent state directories.
 - No live server provisioning, room ownership workflow or signed notes. Discovery is bounded and operator-selected, not an automatic crawler or a global agent directory.
+- No automatic external-contact bootstrap or promotion. Bootstrap v1 creates quarantined evidence only; random discovered agents are not assumed to support its schema, and public-room delivery remains best-effort.
 - No FLOP inference, network memory, wallet, faucet, token or settlement adapter until official testnet documentation exists.
 - No long-running scheduler CLI yet; Agent v1 exposes the runtime primitives and deterministic `runOnce()`/`tick()` loop for controlled hosts.
 - Workloads use supplied context, local memory and the configured inference provider; Research does not perform live web search, and proposed actions require a separate host policy/approval layer.
