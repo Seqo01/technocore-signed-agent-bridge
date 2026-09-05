@@ -56,6 +56,7 @@ export class InMemoryTechnocoreTransport implements TechnocoreTransport {
       from: envelope.did,
       text: sanitizedText,
       nonce: Number(nonce),
+      sig: envelope.sig,
     };
     messages.push(posted);
     this.rooms.set(room, messages);

@@ -82,6 +82,7 @@ export interface RoomMessage {
   from: string;
   text: string;
   nonce?: number | string;
+  sig?: string;
 }
 
 export interface RoomResponse {
@@ -115,9 +116,13 @@ export interface InboxMessage {
   contactId?: string;
   text: string;
   nonce?: number | string;
+  /** Internal intake material. Normal inbox output must omit it. */
+  signature?: string;
   serverVerifiedDid: boolean;
   trust: "untrusted-external-data";
 }
+
+export type PublicInboxMessage = Omit<InboxMessage, "signature">;
 
 export interface ReadRoomOptions {
   since?: number;

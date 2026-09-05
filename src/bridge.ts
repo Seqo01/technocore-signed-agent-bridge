@@ -9,7 +9,7 @@ import { ActionApprovalStore, ApprovalRequiredError, type ActionApproval, type S
 import { hashValue } from "./agent/util.js";
 import { roomClasses } from "./names.js";
 import { didToPublicKeyBytes, sanitizeText, signMessage } from "./protocol.js";
-import type { InboxMessage, RoomResponse, TechnocoreTransport, UnlockedIdentity } from "./types.js";
+import type { InboxMessage, PublicInboxMessage, RoomResponse, TechnocoreTransport, UnlockedIdentity } from "./types.js";
 
 export interface BridgeStores {
   identities: IdentityStore;
@@ -143,13 +143,13 @@ export class SignedAgentBridge {
     if (record.status !== "approved") throw new ProtocolError("Outbound approval already spent; reconcile before follow-up");
   }
 
-  async readInbox(owner: string): Promise<InboxMessage[]> {
+  async readInbox(owner: string): Promise<PublicInboxMessage[]> {
     return this.withIntakeOwnership(owner, async () => {
       const peek = await this.peekInbox(owner);
       if (peek.lastSeq > peek.previousCursor) {
         await this.acknowledgeInbox(owner, peek.lastSeq);
       }
-      return peek.messages;
+      return peek.messages.map(({ signature: _signature, ...message }) => message);
     });
   }
 
@@ -182,6 +182,7 @@ export class SignedAgentBridge {
         ...(contact ? { contactId: contact.contactId } : {}),
         text: message.text,
         ...(message.nonce === undefined ? {} : { nonce: message.nonce }),
+        ...(message.sig === undefined ? {} : { signature: message.sig }),
         serverVerifiedDid,
         trust: "untrusted-external-data",
       });

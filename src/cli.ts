@@ -23,12 +23,15 @@ import { InferenceLedger } from "./agent/inference-accounting.js";
 import { ExternalJobDelivery } from "./swarm/external-delivery.js";
 import { discoveryCommand } from "./discovery/cli.js";
 import { formatDiscoveryFailureDiagnostics } from "./discovery/diagnostics.js";
+import { isOutboundExternalWorkCommand, outboundExternalWorkCommand } from "./swarm/outbound-external-work-cli.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
     "discovery:rooms | discovery:events | discovery:room <public-room> | discovery:did <did> (network flags: see DISCOVERY.md) | discovery:candidates | discovery:inspect <id> | discovery:summary | " +
     "inference:usage <ledger-file> [--session <id>] [--did <public-did>] | " +
+    "external-work:prepare <request-file> | external-work:status <job> | external-work:authorize <job> <action-hash> | " +
+    "external-work:send <job> <action-hash> | external-work:receive <job> | external-work:timeout <job> | external-work:list | " +
     "external:jobs <session> | external:response-prepare <session> <proposal-record> <result-node> | " +
     "external:response-status <session> <effect> | external:response-authorize <session> <effect> <action-hash> | external:response-send <session> <effect> <action-hash> | " +
     "swarm:start --offline --policy <file> --policy-hash <hash> | swarm:status <id> | swarm:stop <id> | " +
@@ -74,6 +77,7 @@ async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
   if (command.startsWith("discovery:")) { await discoveryCommand(command, args); return; }
+  if (isOutboundExternalWorkCommand(command)) { await outboundExternalWorkCommand(command, args); return; }
   if (["external:jobs", "external:response-prepare", "external:response-status", "external:response-authorize", "external:response-send"].includes(command)) {
     const count = command === "external:jobs" ? 1 : command === "external:response-status" ? 2 : 3;
     if (args.length !== count) usage();

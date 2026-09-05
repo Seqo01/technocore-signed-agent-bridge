@@ -147,12 +147,16 @@ function parseMessage(value: unknown): RoomMessage {
   if (record.nonce !== undefined && !Number.isSafeInteger(record.nonce)) {
     throw new ProtocolError("Malformed server response: message nonce is not a safe integer");
   }
+  if (record.sig !== undefined && (typeof record.sig !== "string" || record.sig.length > 512)) {
+    throw new ProtocolError("Malformed server response: message signature");
+  }
   return {
     seq,
     ts: record.ts,
     from: record.from,
     text: record.text,
     ...(record.nonce === undefined ? {} : { nonce: record.nonce as number }),
+    ...(record.sig === undefined ? {} : { sig: record.sig }),
   };
 }
 

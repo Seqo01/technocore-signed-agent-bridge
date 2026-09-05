@@ -24,6 +24,12 @@ Every room name, sender, timestamp and message returned by a remote server is un
 
 The existing bridge inbox model exposes DID/nonce but does not reverify historical signatures. `serverVerifiedDid` means the configured HTTP server represented the record as a signed-lane record. Current upstream records may also include `sig`; the separate discovery adapter verifies it only when exact stored text and nonce are available. Legacy missing signatures and unsafe numeric nonces remain unverified. Local signature verification proves a signed statement, not truthful capabilities, room ownership, independent peer identity or trust in a separate DID note.
 
+The outbound-external-work intake is stricter than the general inbox view. It keeps
+an optional response signature only inside a bounded ignored intake checkpoint,
+never in normal inbox/status output, and requires local `room|nonce|text`
+verification before correlation or review. Missing signatures are invalid responses.
+The exact checkpoint and job linkage are durable before cursor acknowledgement.
+
 Discovery uses a dedicated GET-only path allowlist because Technocore also has
 GET endpoints that write. It refuses redirects, private/mailbox/encrypted room
 classes and arbitrary URLs. Its ignored `.technocore-discovery/` snapshot is

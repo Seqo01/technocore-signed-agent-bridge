@@ -245,6 +245,18 @@ require an explicit read-only flag and the exact reviewed origin. See
 [DISCOVERY.md](DISCOVERY.md) for commands, budgets, signature verification and
 the distinction between candidate discovery and trusted interaction.
 
+## Outbound external work
+
+The one-shot `OutboundExternalWorkCoordinator` can prepare a meaningful bounded job
+from Bob, Charlie, Dave or Eve to an existing operator-managed external contact,
+then correlate a locally signature-verified result and route it to Dave's existing
+`workload.review`. Preparation is not send authority; every request has a separate
+exact action approval, one physical POST maximum, one bounded response observation
+and terminal success/rejection/revision/no-response/invalid/ambiguous outcomes.
+Discovery candidates never become contacts or authority. See
+[OUTBOUND-EXTERNAL-WORK.md](OUTBOUND-EXTERNAL-WORK.md) for the project-local schemas,
+CLI/host API, contract-extraction pilot template and remaining live prerequisites.
+
 ## Current limitations
 
 Inference attempts now have host-bound DID/session/job accounting and pre-dispatch
