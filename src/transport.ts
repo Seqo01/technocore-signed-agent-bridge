@@ -441,6 +441,10 @@ export class HttpTechnocoreTransport implements TechnocoreTransport {
         const media = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
         this.onReadProgress?.({ stage: "http-status", status: response.status, headersReceived: true,
           contentType: media === "application/json" || media === "text/plain" || media === "text/html" ? media : "other" });
+        if (this.readRedirect === "manual" && response.status >= 300 && response.status < 400) {
+          void response.body?.cancel().catch(() => undefined);
+          throw new TransportError("Technocore GET redirect refused; no follow or retry", response.status);
+        }
         if ((response.status === 429 || response.status >= 500) && attempt < this.readRetries) {
           await delay(response.status === 429 ? retryAfterMilliseconds(response.headers.get("retry-after") ?? undefined, this.maxRetryDelayMs) : Math.min(100 * 2 ** attempt, this.maxRetryDelayMs));
           continue;

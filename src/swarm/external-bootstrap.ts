@@ -7,14 +7,17 @@ import { SignedAgentBridge } from "../bridge.js";
 import { createStores } from "../context.js";
 import { DiscoveryStore } from "../discovery/store.js";
 import type { Observation } from "../discovery/model.js";
-import { publicRoom } from "../discovery/model.js";
-import { AmbiguousSendError, BridgeError } from "../errors.js";
-import { atomicCreateJson, atomicWriteJson, readJsonFile, withFileLock } from "../fs-safe.js";
+import { DISCOVERY_ORIGIN, publicRoom } from "../discovery/model.js";
+import { AmbiguousSendError, BridgeError, TransportError } from "../errors.js";
+import { atomicCreateJson, atomicWriteJson } from "../fs-safe.js";
+import { AgentRuntimeLock } from "../agent/runtime-lock.js";
+import { BootstrapFiles } from "./bootstrap-files.js";
+import { bootstrapGet } from "./bootstrap-http.js";
 import { assertLocalAlias, roomClasses } from "../names.js";
 import type { PassphraseProvider } from "../passphrase.js";
 import { didToPublicKeyBytes, sanitizeText, verifySignedMessage } from "../protocol.js";
 import { outboundDiagnostics, SignedPostRejectedError, type OutboundDiagnostics } from "../send-diagnostics.js";
-import { HttpTechnocoreTransport } from "../transport.js";
+import { HttpTechnocoreTransport, type HttpTransportOptions } from "../transport.js";
 import type { RoomMessage, TechnocoreTransport } from "../types.js";
 import { assertNoSecretLikeOutput } from "../workloads/types.js";
 import { safePeerText } from "./proposal.js";
@@ -240,6 +243,7 @@ export interface ExternalBootstrapSummary {
   sentSeq?: number;
   readAttempts: number;
   response?: Omit<BootstrapResponseLink, "checkpointRef">;
+  observationFailure?: "transport-failed" | "persistence-failed";
   promotionProposalHash?: string;
   operatorReviewRequired: true;
   createsContact: false;
@@ -254,6 +258,8 @@ export interface ExternalBootstrapOptions {
   origin?: string;
   /** Test seam only. Production constructs zero-retry HTTP transports. */
   offlineTransport?: TechnocoreTransport;
+  /** Offline tests of the production HTTP adapter; retry/redirect policy cannot be overridden. */
+  httpClient?: Pick<HttpTransportOptions, "fetch" | "httpsRequest">;
   clock?: AgentClock;
   /** Future read-only owner/allow-list verifier boundary. No production implementation exists yet. */
   verifyPublicOwnedRoute?: (
@@ -262,7 +268,13 @@ export interface ExternalBootstrapOptions {
   ) => Promise<PublicOwnedRouteVerification | undefined>;
   /** Test seam proving evidence persistence precedes cursor advancement. */
   beforeCursorAdvance?: (record: Readonly<ExternalBootstrapRecord>, seq: number) => Promise<void>;
+  /** Test seam for a crash after durable observation creation, before record linkage. */
+  afterCheckpointPersisted?: () => Promise<void>;
+  /** Offline crash injection; absent in the production CLI. */
+  onPhase?: (phase: string) => Promise<void>;
 }
+
+class BootstrapInterrupted extends Error {}
 
 const terminal = new Set<ExternalBootstrapState>([
   "ACCEPTED_EVIDENCE", "NO_RESPONSE", "INVALID_RESPONSE", "AMBIGUOUS_DELIVERY", "REJECTED",
@@ -275,7 +287,12 @@ function isHash(value: unknown): value is string {
 }
 
 function isTimestamp(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
+  if (typeof value !== "string" || value.length > 64 ||
+    !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/u.test(value) ||
+    !Number.isFinite(Date.parse(value))) return false;
+  const year = Number(value.slice(0, 4)), month = Number(value.slice(5, 7)), day = Number(value.slice(8, 10));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
 }
 
 function schemas(value: unknown, label: string, allowEmpty = false): string[] {
@@ -286,8 +303,14 @@ function schemas(value: unknown, label: string, allowEmpty = false): string[] {
 }
 
 function privateCapability(text: string): boolean {
-  if (privateCapabilityPattern.test(text)) return true;
-  try { return privateCapabilityPattern.test(decodeURIComponent(text)); } catch { return true; }
+  // Inspect decoded JSON too: escaped capability/token characters must not enter checkpoints.
+  const forms = [text];
+  try { forms.push(decodeURIComponent(text)); } catch { /* Literal percentages are harmless. */ }
+  try { forms.push(JSON.stringify(JSON.parse(text))); } catch { /* Schema validation rejects malformed JSON. */ }
+  return forms.some(form => {
+    if (privateCapabilityPattern.test(form)) return true;
+    try { assertNoSecretLikeOutput(form, "Bootstrap response"); return false; } catch { return true; }
+  });
 }
 
 function validatePublicOwnedRoute(value: unknown, targetDid: string): PublicOwnedRoomDescriptor {
@@ -317,12 +340,18 @@ function effectFor(record: Pick<ExternalBootstrapRecord,
 function publicSendDestination(room: string): string { return hashValue({ room }); }
 
 class GuardedBootstrapApprovals extends ActionApprovalStore {
-  constructor(directory: string, private readonly guard: (effect: ExactActionEffect, id?: string) => Promise<void>) {
+  constructor(directory: string, private readonly guard: (effect: ExactActionEffect, id?: string) => Promise<void>,
+    private readonly checkExpiry: () => void) {
     super(directory);
   }
   override async consume(effect: ExactActionEffect, id?: string) {
     await this.guard(effect, id);
-    return super.consume(effect, id);
+    this.checkExpiry();
+    const approval = await super.consume(effect, id);
+    // Approval consumption performs awaited disk IO before the bridge reserves a nonce.
+    try { this.checkExpiry(); }
+    catch (error) { await this.finish(effect.agentAlias, approval.actionId, "failed"); throw error; }
+    return approval;
   }
 }
 
@@ -332,12 +361,26 @@ export class ExternalBootstrapCoordinator {
   private readonly discovery: DiscoveryStore;
   private readonly clock: AgentClock;
   readonly directory: string;
+  private readonly files: BootstrapFiles;
 
   constructor(private readonly options: ExternalBootstrapOptions) {
     this.stores = createStores(options.root, options.passphrases);
     this.discovery = new DiscoveryStore(options.discoveryWorkspace);
     this.clock = options.clock ?? systemClock;
     this.directory = resolve(this.stores.paths.root, "external-bootstrap");
+    this.files = new BootstrapFiles(this.directory);
+  }
+
+  private async phase(name: string): Promise<void> {
+    try { await this.options.onPhase?.(name); }
+    catch { throw new BootstrapInterrupted("Simulated bootstrap interruption"); }
+  }
+
+  private async locked<T>(path: string, fn: () => Promise<T>): Promise<T> {
+    await this.files.check(path); await this.files.check(`${path}.lifecycle-lock`);
+    // Reuse the process-aware lock; a slow unlock/GET must not lose ownership after a TTL.
+    const lock = await AgentRuntimeLock.acquire(`${path}.lifecycle-lock`);
+    try { return await fn(); } finally { await lock.release(); }
   }
 
   private now(): string { return this.clock().toISOString(); }
@@ -351,7 +394,14 @@ export class ExternalBootstrapCoordinator {
   private transport(): TechnocoreTransport {
     if (this.options.offlineTransport) return this.options.offlineTransport;
     if (!this.options.origin) throw new BridgeError("Technocore origin is required; no request made");
-    return new HttpTechnocoreTransport(this.options.origin, { readRetries: 0, rateLimitRetries: 0 });
+    try {
+      const url = new URL(this.options.origin);
+      if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.pathname !== "/" ||
+        !this.options.httpClient && url.origin !== DISCOVERY_ORIGIN) throw new Error("origin");
+    } catch { throw new BridgeError("Bootstrap requires the official HTTPS origin without credentials or paths"); }
+    return new HttpTechnocoreTransport(this.options.origin, { ...this.options.httpClient,
+      fetch: this.options.httpClient?.fetch ?? bootstrapGet(this.options.httpClient?.httpsRequest),
+      readRetries: 0, rateLimitRetries: 0, readRedirect: "manual" });
   }
 
   private summary(record: ExternalBootstrapRecord): ExternalBootstrapSummary {
@@ -366,6 +416,7 @@ export class ExternalBootstrapCoordinator {
       state: record.state === "SENDING" ? "AMBIGUOUS_DELIVERY" : record.state,
       sendAttemptCount: record.sendAttemptCount, ...(record.sentSeq === undefined ? {} : { sentSeq: record.sentSeq }),
       readAttempts: record.observation.readAttempts,
+      ...(record.observation.readFailure ? { observationFailure: record.observation.readFailure } : {}),
       ...(record.response ? { response: (({ checkpointRef: _checkpointRef, ...safe }) => structuredClone(safe))(record.response) } : {}),
       ...(record.promotionProposalHash ? { promotionProposalHash: record.promotionProposalHash } : {}),
       operatorReviewRequired: true, createsContact: false, grantsAuthority: false,
@@ -437,7 +488,7 @@ export class ExternalBootstrapCoordinator {
   }
 
   private async record(id: string): Promise<ExternalBootstrapRecord> {
-    const value = await readJsonFile<ExternalBootstrapRecord | null>(this.recordPath(id), null);
+    const value = await this.files.read<ExternalBootstrapRecord | null>(this.recordPath(id), null);
     if (!value || value.bootstrapId !== id) throw new BridgeError("Missing external bootstrap record");
     this.validateStored(value); return value;
   }
@@ -465,6 +516,7 @@ export class ExternalBootstrapCoordinator {
 
   private async validateCurrent(record: ExternalBootstrapRecord): Promise<void> {
     this.validateStored(record);
+    await this.files.check(resolve(this.directory, "approvals", record.requesterAlias, `${record.actionId}.json`));
     const identity = await this.stores.identities.inspect(record.requesterAlias);
     if (identity.did !== record.requesterDid) throw new BridgeError("Bootstrap requester identity changed");
     const current = await this.discovery.inspectCandidate(record.candidateId);
@@ -478,6 +530,12 @@ export class ExternalBootstrapCoordinator {
   }
 
   async prepare(input: PrepareExternalBootstrap): Promise<ExternalBootstrapSummary> {
+    if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key =>
+      !["candidateId", "requesterAlias", "targetDid", "selectedPublicRoom", "selectedRoomGeneration",
+        "supportedRequestSchemas", "supportedResultSchemas", "proposedResponseMode", "proposedResponseRoute", "expiresAt"].includes(key)) ||
+      typeof input.targetDid !== "string" || input.targetDid.length > 128 ||
+      typeof input.requesterAlias !== "string" || typeof input.selectedPublicRoom !== "string") throw new BridgeError("Invalid bootstrap input");
+    await this.files.check(this.directory);
     if (!isHash(input.candidateId)) throw new BridgeError("Invalid discovery candidate id");
     assertLocalAlias(input.requesterAlias); didToPublicKeyBytes(input.targetDid);
     if (!publicRoom(input.selectedPublicRoom)) throw new BridgeError("Bootstrap requires a public non-mailbox room");
@@ -527,7 +585,10 @@ export class ExternalBootstrapCoordinator {
       state: "PREPARED" };
     record.actionHash = hashValue({ actionId: record.actionId, ...effectFor(record) });
     this.validateStored(record);
+    await this.files.check(resolve(this.directory, "approvals", record.requesterAlias, `${record.actionId}.json`));
+    await this.phase("before-approval-persistence");
     const approval = await this.approvals().propose(effectFor(record), record.actionId);
+    await this.phase("after-approval-persistence");
     if (approval.actionHash !== record.actionHash) throw new BridgeError("Bootstrap approval binding mismatch");
     await atomicCreateJson(this.recordPath(record.bootstrapId), record);
     return this.summary(record);
@@ -545,7 +606,7 @@ export class ExternalBootstrapCoordinator {
   }
 
   async authorize(id: string, expectedActionHash: string): Promise<ExternalBootstrapSummary> {
-    return withFileLock(this.recordPath(id), async () => {
+    return this.locked(this.recordPath(id), async () => {
       const record = await this.record(id); await this.validateCurrent(record);
       if (expectedActionHash !== record.actionHash) throw new BridgeError("Bootstrap action hash mismatch");
       const approval = await this.approvals().read(record.requesterAlias, record.actionId);
@@ -559,20 +620,27 @@ export class ExternalBootstrapCoordinator {
   }
 
   async send(id: string, expectedActionHash: string): Promise<ExternalBootstrapSummary> {
-    return withFileLock(this.recordPath(id), async () => {
+    return this.locked(this.recordPath(id), async () => {
       const record = await this.record(id); await this.validateCurrent(record);
       if (record.state !== "AUTHORIZED" || expectedActionHash !== record.actionHash) throw new BridgeError("Exact bootstrap authorization required");
-      if (Date.parse(record.expiresAt) <= this.clock().getTime()) throw new BridgeError("Bootstrap authorization expired; no POST made");
+      if (Date.parse(record.expiresAt) <= this.clock().getTime()) {
+        record.state = "REJECTED"; await atomicWriteJson(this.recordPath(id), record);
+        throw new BridgeError("Bootstrap authorization expired; no POST made");
+      }
       const base = this.transport();
       const approvals = new GuardedBootstrapApprovals(resolve(this.directory, "approvals"), async (effect, actionId) => {
+        await this.phase("before-nonce-reservation");
         const persisted = await this.record(id); await this.validateCurrent(persisted);
         if (hashValue(persisted) !== hashValue(record) || actionId !== record.actionId ||
           hashValue(effect) !== hashValue(effectFor(record))) throw new BridgeError("Bootstrap binding changed before nonce reservation");
+      }, () => {
+        if (this.clock().getTime() >= Date.parse(record.expiresAt)) throw new BridgeError("Bootstrap expired before nonce reservation");
       });
       const transport: TechnocoreTransport = {
         readRoomText: async () => { throw new BridgeError("Bootstrap send has no read authority"); },
         readRoomJson: async () => { throw new BridgeError("Bootstrap send has no read authority"); },
         sendSignedMessage: async (room, envelope) => {
+          await this.phase("after-nonce-reservation");
           const persisted = await this.record(id); await this.validateCurrent(persisted);
           const approval = await approvals.read(record.requesterAlias, record.actionId);
           if (hashValue(persisted) !== hashValue(record) || approval.status !== "executing" ||
@@ -580,8 +648,18 @@ export class ExternalBootstrapCoordinator {
             envelope.did !== record.requesterDid || hashValue(envelope.text) !== record.transportPayloadHash) {
             throw new BridgeError("Bootstrap binding changed before dispatch");
           }
+          if (this.clock().getTime() >= Date.parse(record.expiresAt)) throw new BridgeError("Bootstrap expired before dispatch");
+          await this.phase("before-send-intent");
           record.state = "SENDING"; record.sendAttemptCount = 1; await atomicWriteJson(this.recordPath(id), record);
+          await this.phase("after-send-intent");
+          await this.phase("before-physical-post");
+          // Recheck after the durable send intent too: expiry during disk IO must not dispatch.
+          if (this.clock().getTime() >= Date.parse(record.expiresAt)) {
+            record.sendAttemptCount = 0;
+            throw new BridgeError("Bootstrap expired before dispatch");
+          }
           const response = await base.sendSignedMessage(room, envelope);
+          await this.phase("after-receipt");
           const posted = response.posted;
           if (!posted || !Number.isSafeInteger(posted.seq) || posted.seq < 1 || posted.from !== envelope.did ||
             String(posted.nonce) !== envelope.nonce || hashValue(posted.text) !== record.transportPayloadHash) {
@@ -599,6 +677,7 @@ export class ExternalBootstrapCoordinator {
         record.state = "SENT"; await atomicWriteJson(this.recordPath(id), record);
         record.state = "AWAITING_RESPONSE"; await atomicWriteJson(this.recordPath(id), record);
       } catch (error) {
+        if (error instanceof BootstrapInterrupted || (error as Error).cause instanceof BootstrapInterrupted) throw error;
         const diagnostics = outboundDiagnostics(error);
         if (diagnostics) record.deliveryDiagnostics = diagnostics;
         if (record.sendAttemptCount === 0) record.state = "REJECTED";
@@ -615,12 +694,14 @@ export class ExternalBootstrapCoordinator {
   }
 
   private retained(message: RoomMessage): RetainedBootstrapMessage {
-    const omitted = privateCapability(message.text);
-    return { seq: message.seq, ts: message.ts, senderDid: message.from,
+    const omitted = message.text.length > 16_384 || privateCapability(message.text);
+    let senderDid = "[INVALID_DID]";
+    try { if (message.from.length <= 128) { didToPublicKeyBytes(message.from); senderDid = message.from; } } catch { /* omit unsafe sender */ }
+    return { seq: message.seq, ts: message.ts, senderDid,
       messageHash: hashValue({ seq: message.seq, did: message.from, text: message.text, nonce: message.nonce }),
       contentOmitted: omitted, ...(omitted ? {} : { text: message.text }),
       ...(message.nonce === undefined ? {} : { nonce: message.nonce }),
-      ...(!omitted && message.sig !== undefined ? { signature: message.sig } : {}) };
+      ...(!omitted && message.sig !== undefined && /^[A-Za-z0-9_-]{86}$/u.test(message.sig) ? { signature: message.sig } : {}) };
   }
 
   private validateCheckpoint(checkpoint: BootstrapObservationCheckpoint, record: ExternalBootstrapRecord): void {
@@ -633,9 +714,20 @@ export class ExternalBootstrapCoordinator {
       throw new BridgeError("Invalid bootstrap observation checkpoint");
     }
     if (typeof checkpoint.matchingOverflow !== "boolean") throw new BridgeError("Invalid bootstrap observation checkpoint");
+    if (!record.observation.readStartedAt || !isTimestamp(checkpoint.observedAt) ||
+      Date.parse(checkpoint.observedAt) < Date.parse(record.observation.readStartedAt) ||
+      Date.parse(checkpoint.observedAt) > this.clock().getTime()) throw new BridgeError("Invalid bootstrap observation time");
+    for (const m of checkpoint.matchingMessages) {
+      if (!m || !Number.isSafeInteger(m.seq) || m.seq < 1 || typeof m.senderDid !== "string" || m.senderDid.length > 128 ||
+        typeof m.ts !== "string" || m.ts.length > 64 || !Number.isFinite(Date.parse(m.ts)) || !isHash(m.messageHash) || typeof m.contentOmitted !== "boolean" ||
+        m.text !== undefined && (typeof m.text !== "string" || m.text.length > 16_384 || privateCapability(m.text)) ||
+        m.signature !== undefined && (typeof m.signature !== "string" || m.signature.length > 512)) {
+        throw new BridgeError("Invalid bootstrap retained message");
+      }
+    }
   }
 
-  private async verifyResponse(message: RetainedBootstrapMessage, record: ExternalBootstrapRecord): Promise<{
+  private async verifyResponse(message: RetainedBootstrapMessage, record: ExternalBootstrapRecord, observedAt: string): Promise<{
     envelope: ExternalBootstrapResponseEnvelope; state: "ACCEPTED_EVIDENCE" | "REJECTED";
     failureCode?: string; routeHash: string; ownedVerification?: PublicOwnedRouteVerification;
   }> {
@@ -657,8 +749,8 @@ export class ExternalBootstrapCoordinator {
       value.bootstrapId !== record.bootstrapId || value.challengeId !== record.challengeId ||
       value.requesterDid !== record.requesterDid || value.responderDid !== record.targetDid || typeof value.accepted !== "boolean" ||
       value.responseMode !== record.proposedResponseMode || !isTimestamp(value.createdAt) || !isTimestamp(value.expiresAt) ||
-      Date.parse(value.createdAt as string) < Date.parse(record.createdAt) || Date.parse(value.createdAt as string) > this.clock().getTime() + 60_000 ||
-      Date.parse(value.expiresAt as string) <= this.clock().getTime() || Date.parse(value.expiresAt as string) > Date.parse(record.expiresAt) ||
+      Date.parse(value.createdAt as string) < Date.parse(record.createdAt) || Date.parse(value.createdAt as string) > Date.parse(observedAt) + 60_000 ||
+      Date.parse(value.expiresAt as string) <= Date.parse(observedAt) || Date.parse(value.expiresAt as string) > Date.parse(record.expiresAt) ||
       Date.parse(value.expiresAt as string) <= Date.parse(value.createdAt as string) ||
       record.challengeConsumedAt !== undefined) throw new BridgeError("invalid-response-correlation-or-freshness");
     const acceptedRequests = schemas(value.acceptedRequestSchemas, "accepted request schemas", true);
@@ -700,13 +792,16 @@ export class ExternalBootstrapCoordinator {
     const next = checkpoint.lastReturnedSeq ?? checkpoint.previousCursor;
     if (next < record.observation.acknowledgedThrough) throw new BridgeError("Bootstrap observation cursor regression");
     await this.options.beforeCursorAdvance?.(structuredClone(record), next);
+    await this.phase("before-cursor");
     record.observation.acknowledgedThrough = next;
     await atomicWriteJson(this.recordPath(record.bootstrapId), record);
+    await this.phase("after-cursor");
   }
 
   private async completePendingCursor(record: ExternalBootstrapRecord): Promise<boolean> {
     if (!record.observation.checkpointRef || !record.observation.checkpointHash) return false;
-    const checkpoint = await readJsonFile<BootstrapObservationCheckpoint | null>(record.observation.checkpointRef, null);
+    if (record.observation.checkpointRef !== this.checkpointPath(record.bootstrapId)) throw new BridgeError("Bootstrap checkpoint path changed");
+    const checkpoint = await this.files.read<BootstrapObservationCheckpoint | null>(record.observation.checkpointRef, null);
     if (!checkpoint || hashValue(checkpoint) !== record.observation.checkpointHash) throw new BridgeError("Bootstrap observation evidence changed");
     this.validateCheckpoint(checkpoint, record);
     const expected = checkpoint.lastReturnedSeq ?? checkpoint.previousCursor;
@@ -729,23 +824,32 @@ export class ExternalBootstrapCoordinator {
   private async processCheckpoint(record: ExternalBootstrapRecord, checkpoint: BootstrapObservationCheckpoint,
     checkpointRef: string): Promise<void> {
     this.validateCheckpoint(checkpoint, record);
+    // A complete validated observation supersedes an earlier interrupted installation error.
+    delete record.observation.readFailure;
     const checkpointHash = hashValue(checkpoint);
     record.observation.checkpointRef = checkpointRef; record.observation.checkpointHash = checkpointHash;
     const generationMismatch = record.observation.generation !== undefined &&
       (checkpoint.generation === undefined || checkpoint.generation !== record.observation.generation);
     const retentionGap = checkpoint.firstSeq !== null && checkpoint.firstSeq > checkpoint.previousCursor + 1;
-    const windowIncomplete = checkpoint.lastReturnedSeq !== null && checkpoint.lastReturnedSeq < checkpoint.lastSeq;
-    if (generationMismatch || retentionGap || windowIncomplete || checkpoint.matchingOverflow || checkpoint.matchingMessages.length > 1) {
+    const sequenceInvalid = checkpoint.lastSeq < checkpoint.previousCursor ||
+      checkpoint.firstSeq === null && checkpoint.lastReturnedSeq !== null ||
+      checkpoint.firstSeq !== null && checkpoint.firstSeq > checkpoint.lastSeq ||
+      checkpoint.lastReturnedSeq !== null && (checkpoint.lastReturnedSeq <= checkpoint.previousCursor || checkpoint.lastReturnedSeq > checkpoint.lastSeq) ||
+      checkpoint.matchingMessages.some((m, i, all) => m.seq <= checkpoint.previousCursor || m.seq > checkpoint.lastSeq ||
+        checkpoint.firstSeq !== null && m.seq < checkpoint.firstSeq ||
+        i > 0 && m.seq <= all[i - 1]!.seq);
+    const windowIncomplete = (checkpoint.lastReturnedSeq ?? checkpoint.previousCursor) < checkpoint.lastSeq;
+    if (generationMismatch || retentionGap || sequenceInvalid || windowIncomplete || checkpoint.matchingOverflow || checkpoint.matchingMessages.length > 1) {
       const message = checkpoint.matchingMessages[0];
       record.state = "INVALID_RESPONSE";
       record.response = { checkpointRef, checkpointHash, seq: message?.seq ?? checkpoint.lastReturnedSeq ?? checkpoint.previousCursor + 1,
         senderDid: message?.senderDid ?? record.targetDid,
         messageHash: message?.messageHash ?? hashValue({ bootstrapId: record.bootstrapId, checkpointHash }),
-        locallyVerified: false, failureCode: generationMismatch ? "room-generation-mismatch" : retentionGap ? "retention-gap" :
+        locallyVerified: false, failureCode: generationMismatch ? "room-generation-mismatch" : retentionGap ? "retention-gap" : sequenceInvalid ? "sequence-regression" :
           windowIncomplete ? "incomplete-observation-window" : "conflicting-or-replayed-response", receivedAt: this.now(), acknowledged: false };
       await atomicWriteJson(this.recordPath(record.bootstrapId), record);
-      await this.advanceCursor(record, checkpoint); record.response.acknowledged = true;
-      await atomicWriteJson(this.recordPath(record.bootstrapId), record); return;
+      // Unsafe windows have durable evidence but must never authorize cursor movement.
+      return;
     }
     const message = checkpoint.matchingMessages[0];
     if (!message) {
@@ -753,31 +857,57 @@ export class ExternalBootstrapCoordinator {
       await this.advanceCursor(record, checkpoint); return;
     }
     try {
-      const result = await this.verifyResponse(message, record);
+      await this.phase("before-verification");
+      const result = await this.verifyResponse(message, record, checkpoint.observedAt);
+      await this.phase("after-verification");
       record.response = { checkpointRef, checkpointHash, seq: message.seq, senderDid: message.senderDid,
         messageHash: message.messageHash, ...(message.signature ? { signatureHash: hashValue(message.signature) } : {}),
         locallyVerified: true, accepted: result.envelope.accepted,
         agreedRequestSchemas: [...result.envelope.acceptedRequestSchemas], agreedResultSchemas: [...result.envelope.acceptedResultSchemas],
         responseMode: result.envelope.responseMode, routeHash: result.routeHash,
-        ...(result.failureCode ? { failureCode: result.failureCode } : {}), receivedAt: this.now(), acknowledged: false };
+        ...(result.failureCode ? { failureCode: result.failureCode } : {}), receivedAt: checkpoint.observedAt, acknowledged: false };
       record.acceptedResponse = result.envelope; record.challengeConsumedAt = this.now();
       if (result.ownedVerification) record.publicOwnedRouteVerification = result.ownedVerification;
       record.state = result.state;
     } catch (error) {
+      if (error instanceof BootstrapInterrupted) throw error;
       const code = error instanceof BridgeError && /^[a-z0-9-]+$/u.test(error.message) ? error.message : "invalid-bootstrap-response";
       record.response = { checkpointRef, checkpointHash, seq: message.seq, senderDid: message.senderDid,
         messageHash: message.messageHash, ...(message.signature ? { signatureHash: hashValue(message.signature) } : {}),
         locallyVerified: false, failureCode: code, receivedAt: this.now(), acknowledged: false };
       record.state = "INVALID_RESPONSE";
     }
+    await this.phase("before-evidence-linkage");
     await atomicWriteJson(this.recordPath(record.bootstrapId), record);
+    await this.phase("after-evidence-linkage");
     await this.advanceCursor(record, checkpoint); record.response.acknowledged = true;
     await atomicWriteJson(this.recordPath(record.bootstrapId), record);
   }
 
+  private async recoverUnlinkedCheckpoint(record: ExternalBootstrapRecord): Promise<boolean> {
+    if (record.observation.checkpointRef) return false;
+    const path = this.checkpointPath(record.bootstrapId);
+    let checkpoint: BootstrapObservationCheckpoint | null;
+    try { checkpoint = await this.files.recover<BootstrapObservationCheckpoint>(path, value => this.validateCheckpoint(value, record)); }
+    catch {
+      record.state = "AMBIGUOUS_DELIVERY"; record.observation.readFailure = "persistence-failed";
+      await atomicWriteJson(this.recordPath(record.bootstrapId), record); return true;
+    }
+    if (!checkpoint) return false;
+    if (record.observation.readAttempts !== 1 || !record.observation.readStartedAt ||
+      !isTimestamp(checkpoint.observedAt) || Date.parse(checkpoint.observedAt) < Date.parse(record.observation.readStartedAt) ||
+      Date.parse(checkpoint.observedAt) > this.clock().getTime()) {
+      throw new BridgeError("Bootstrap checkpoint has no matching receive intent");
+    }
+    await this.processCheckpoint(record, checkpoint, path);
+    return true;
+  }
+
   async receive(id: string): Promise<ExternalBootstrapSummary> {
-    return withFileLock(this.recordPath(id), async () => {
+    return this.locked(this.recordPath(id), async () => {
       const record = await this.record(id); await this.validateCurrent(record);
+      if (record.state === "INVALID_RESPONSE" && ["room-generation-mismatch", "retention-gap", "sequence-regression", "incomplete-observation-window", "conflicting-or-replayed-response"]
+        .includes(record.response?.failureCode ?? "")) return this.summary(record);
       if (await this.completePendingCursor(record)) return this.summary(record);
       if (terminal.has(record.state)) return this.summary(record);
       if (record.state === "SENT" && record.sentSeq !== undefined) {
@@ -786,18 +916,26 @@ export class ExternalBootstrapCoordinator {
         record.state = "AWAITING_RESPONSE"; await atomicWriteJson(this.recordPath(id), record);
       }
       if (record.state !== "AWAITING_RESPONSE") throw new BridgeError("Bootstrap is not awaiting a response");
+      if (await this.recoverUnlinkedCheckpoint(record)) return this.summary(record);
       if (Date.parse(record.expiresAt) <= this.clock().getTime()) throw new BridgeError("Bootstrap deadline elapsed; use timeout without a new GET");
       if (record.observation.readAttempts >= 1) return this.summary(record);
       const checkpointRef = this.checkpointPath(id);
-      let checkpoint = await readJsonFile<BootstrapObservationCheckpoint | null>(checkpointRef, null);
+      let checkpoint = await this.files.read<BootstrapObservationCheckpoint | null>(checkpointRef, null);
       if (!checkpoint) {
+        await this.phase("before-read-intent");
         record.observation.readAttempts = 1; record.observation.readStartedAt = this.now();
         await atomicWriteJson(this.recordPath(id), record);
+        await this.phase("after-read-intent");
         let readCompleted = false;
         try {
           const view = await this.transport().readRoomJson(record.selectedPublicRoom,
             { since: record.observation.since, wait: 0, limit: 200 });
           readCompleted = true;
+          await this.phase("after-get");
+          if (view.room !== undefined && view.room !== record.selectedPublicRoom) throw new BridgeError("Bootstrap response room mismatch");
+          if (view.messages.length > 200 || view.count !== view.messages.length || view.messages.some((m, i, all) =>
+            typeof m.ts !== "string" || m.ts.length > 64 || !Number.isFinite(Date.parse(m.ts)) ||
+            m.seq <= record.observation.since || i > 0 && m.seq <= all[i - 1]!.seq)) throw new BridgeError("Bootstrap response sequence or timestamp mismatch");
           const relevant = view.messages.filter(message => this.relevantMessage(message, id));
           const matching = relevant.slice(0, 16).map(message => this.retained(message));
           checkpoint = { version: 1, bootstrapId: id, roomHash: hashValue(record.selectedPublicRoom),
@@ -805,50 +943,57 @@ export class ExternalBootstrapCoordinator {
             lastReturnedSeq: view.messages.at(-1)?.seq ?? null,
             ...(view.generation === undefined ? {} : { generation: view.generation }), matchingMessages: matching,
             matchingOverflow: relevant.length > 16, observedAt: this.now() };
-          await atomicCreateJson(checkpointRef, checkpoint);
+          await this.files.checkpoint(checkpointRef, checkpoint, name => this.phase(name));
         } catch (error) {
+          if (error instanceof BootstrapInterrupted) throw error;
           record.observation.readFailure = readCompleted ? "persistence-failed" : "transport-failed";
-          await atomicWriteJson(this.recordPath(id), record); throw error;
+          await atomicWriteJson(this.recordPath(id), record);
+          if (error instanceof TransportError && error.status !== undefined && error.status >= 300 && error.status < 400) {
+            throw new TransportError("Technocore GET redirect refused; no follow or retry", error.status);
+          }
+          throw new BridgeError("Bootstrap observation incomplete; no retry");
         }
       }
+      await this.options.afterCheckpointPersisted?.();
       await this.processCheckpoint(record, checkpoint, checkpointRef);
       return this.summary(record);
     });
   }
 
   async timeout(id: string): Promise<ExternalBootstrapSummary> {
-    return withFileLock(this.recordPath(id), async () => {
+    return this.locked(this.recordPath(id), async () => {
       const record = await this.record(id); await this.validateCurrent(record);
       if (terminal.has(record.state)) return this.summary(record);
+      if (record.state === "AWAITING_RESPONSE" && await this.recoverUnlinkedCheckpoint(record) && terminal.has(record.state)) {
+        return this.summary(record);
+      }
       if (record.state !== "AWAITING_RESPONSE" || record.observation.readAttempts !== 1 ||
         Date.parse(record.expiresAt) > this.clock().getTime()) {
         throw new BridgeError("NO_RESPONSE requires an elapsed deadline and one spent bounded observation");
       }
+      if (!record.observation.checkpointRef || !record.observation.checkpointHash || record.observation.readFailure) {
+        record.state = "AMBIGUOUS_DELIVERY"; record.observation.readFailure ??= "persistence-failed";
+        await atomicWriteJson(this.recordPath(id), record); return this.summary(record);
+      }
+      await this.completePendingCursor(record);
       record.state = "NO_RESPONSE"; await atomicWriteJson(this.recordPath(id), record); return this.summary(record);
     });
   }
 
   async proposal(id: string): Promise<ExternalBootstrapPromotionProposal> {
-    return withFileLock(this.recordPath(id), async () => {
+    return this.locked(this.recordPath(id), async () => {
       const record = await this.record(id); await this.validateCurrent(record);
       if (record.state !== "ACCEPTED_EVIDENCE" || !record.response?.locallyVerified ||
         !record.response.accepted || !record.acceptedResponse || !record.response.routeHash) {
         throw new BridgeError("A locally verified accepted bootstrap response is required for a promotion proposal");
       }
       const path = this.proposalPath(id);
-      const existing = await readJsonFile<ExternalBootstrapPromotionProposal | null>(path, null);
-      if (existing) {
-        const expectedId = hashValue({ bootstrapId: id, evidenceHash: record.response.messageHash,
-          routeHash: record.response.routeHash });
-        if (existing.version !== 1 || existing.kind !== "external-bootstrap-promotion-proposal" ||
-          existing.proposalId !== expectedId || existing.bootstrapId !== id || existing.candidateId !== record.candidateId ||
-          existing.targetDid !== record.targetDid || existing.operatorReviewRequired !== true ||
-          existing.createsContact !== false || existing.grantsAuthority !== false) {
-          throw new BridgeError("Existing bootstrap proposal does not match current evidence");
-        }
-        record.promotionProposalRef = path; record.promotionProposalHash = hashValue(existing);
-        await atomicWriteJson(this.recordPath(id), record);
-        return structuredClone(existing);
+      const existing = await this.files.read<ExternalBootstrapPromotionProposal | null>(path, null);
+      await this.completePendingCursor(record);
+      const checkpoint = await this.files.read<BootstrapObservationCheckpoint | null>(this.checkpointPath(id), null);
+      if (!checkpoint || checkpoint.matchingMessages.length !== 1 ||
+        safePeerText(record.acceptedResponse, 4096) !== checkpoint.matchingMessages[0]?.text) {
+        throw new BridgeError("Bootstrap accepted response differs from durable evidence");
       }
       const response = record.acceptedResponse;
       const proposal: ExternalBootstrapPromotionProposal = { version: 1, kind: "external-bootstrap-promotion-proposal",
@@ -867,8 +1012,13 @@ export class ExternalBootstrapCoordinator {
         warnings: ["Quarantined evidence only; this is not a contact or trust grant",
           "Public-room reachability is best-effort and content remains public",
           "Operator must independently review the endpoint and schema agreement"],
-        operatorReviewRequired: true, createsContact: false, grantsAuthority: false, createdAt: this.now() };
-      await atomicCreateJson(path, proposal);
+        operatorReviewRequired: true, createsContact: false, grantsAuthority: false, createdAt: existing?.createdAt ?? this.now() };
+      if (existing && (!isTimestamp(existing.createdAt) || hashValue(existing) !== hashValue(proposal) ||
+        record.promotionProposalHash !== undefined && record.promotionProposalHash !== hashValue(existing))) {
+        throw new BridgeError("Existing bootstrap proposal does not match current evidence");
+      }
+      if (existing && record.promotionProposalRef === path && record.promotionProposalHash === hashValue(existing)) return structuredClone(existing);
+      if (!existing) await atomicCreateJson(path, proposal);
       record.promotionProposalRef = path; record.promotionProposalHash = hashValue(proposal);
       await atomicWriteJson(this.recordPath(id), record);
       return structuredClone(proposal);

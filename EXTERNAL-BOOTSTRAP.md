@@ -44,11 +44,27 @@ Preparation creates a `requested` exact-action record. Authorization requires th
 
 Any mutation fails closed. Private keys, passphrases and signatures are never included in CLI summaries.
 
+Expiry uses the current clock again after identity unlock and approval persistence, immediately before nonce reservation, and before dispatch (including after durable send-intent persistence). Reaching the expiry boundary is a refusal: no POST, a durable `REJECTED` result, and no automatic resend. A nonce already reserved before expiry remains consumed; it is never rolled back or reused.
+
 ## Same-room observation
 
 Response intake is one explicit GET with `since=<successful-handshake-seq>`, `wait=0`, `limit=200` and zero automatic read retries. It uses a bootstrap-specific cursor and checkpoint; normal mailbox cursors are not read or changed.
 
+Bootstrap GETs use a single native `node:https` request behind the shared response parser, with a 15-second total request/body timeout and a 2 MiB response limit. Global fetch/Undici is not used: the installed Node runtime's fetch implementation can automatically repeat HTTP 421 even with manual redirects. Any 3xx is refused without retaining/logging the response body or Location, following another endpoint, or advancing the cursor. Same-origin redirects are also refused. Signed POSTs retain the existing no-follow behavior and classify 3xx as `AMBIGUOUS_DELIVERY`, with no retry. The production bootstrap origin must be the official HTTPS discovery origin, without credentials or extra paths. Unrelated transports keep their existing behavior.
+
 Only messages claiming the exact bootstrap ID are retained. Unrelated public-room content is discarded. Candidate response evidence is persisted before verification linkage and before advancing the isolated cursor. A crash between evidence persistence and cursor advancement is recovered from the retained checkpoint without another GET.
+
+`receive` checks for an unlinked durable checkpoint before the spent-read budget or deadline checks. `timeout` also recovers that evidence before assigning `NO_RESPONSE`. Recovery validates the checkpoint's bootstrap/room/cursor and receive-intent association, verifies and persists the result, then acknowledges the isolated cursor. Response freshness is evaluated at the persisted observation time, not the restart time. Repeated recovery does not duplicate evidence or cursor advancement. Without a checkpoint, a spent read never permits another GET and cannot justify `NO_RESPONSE`.
+
+### Process-crash durability and uncertainty
+
+Checkpoint writes use a deterministic `.candidate` file, flush its content, then rename it. Restart checks that file and strictly named legacy temporary files belonging to this bootstrap only. Complete, consistent candidates are validated, flushed and installed offline. Partial, oversized, conflicting, unsafe or unbound candidates are retained for investigation; they produce explicit `AMBIGUOUS_DELIVERY` with `observationFailure`, never a fabricated empty observation. A GET that failed, or whose result was lost before any complete checkpoint existed, likewise cannot produce `NO_RESPONSE` at timeout. This state may describe observation uncertainty even when the original POST was confirmed.
+
+Local reads are bounded to 512 KiB, recovery to eight matching candidates and 4096 directory entries; symlinks/junctions inside the bootstrap quarantine are rejected. Unrelated temporary files are not consumed or deleted. Lifecycle operations reuse the existing process-aware runtime lock, not an age-only stale-lock rule. A corrupt or ambiguous lock fails closed instead of being stolen.
+
+The supported recovery model is process termination/restart on a trusted local filesystem. Files are fsynced; checkpoint parent directories are also fsynced where supported. Node on Windows does not provide portable directory-fsync guarantees. Sudden power loss, storage rollback, hardware loss or an actively malicious same-user filesystem writer are not guaranteed recoverable. Do not automatically replay actions after restoring an old state backup. No claim of physical power-cut testing is made.
+
+Room/sequence regression, retention gaps, incomplete windows and conflicting duplicates cannot advance the isolated cursor. Local signature/correlation checks still gate acceptance. Unsafe capability/auth-like material, including escaped JSON values, is omitted before checkpoint persistence. A promotion proposal is checked against all expected fields and retained response evidence; reopening it does not silently bless modified fields.
 
 A response is accepted only after local Ed25519 verification over the exact room, nonce and text, plus exact DID, bootstrap, challenge, requester, freshness, schema and route correlation. `serverVerifiedDid` is not used as proof. Unsigned, wrongly signed, replayed, conflicting, expired, malformed or capability-bearing responses become `INVALID_RESPONSE`.
 
@@ -95,7 +111,11 @@ npm.cmd run bootstrap:timeout -- <bootstrap-id>
 npm.cmd run bootstrap:proposal -- <bootstrap-id>
 ```
 
-`receive` is a single bounded observation, not polling. `timeout` is local and may produce `NO_RESPONSE` only after the deadline and one spent observation. `NO_RESPONSE` means no valid correlated response was observed in that bounded window; it does not prove the target never replied elsewhere.
+`receive` is a single bounded observation, not polling. `timeout` is local and may produce `NO_RESPONSE` only after the deadline and a successful, complete, durably retained observation without a matching response. `NO_RESPONSE` does not prove the target never replied elsewhere. A successful CLI invocation exits 0 and prints its durable state, including non-success terminal states; argument/transport/persistence errors exit 1. Exit 0 alone is not evidence of an accepted handshake.
+
+### Offline validation
+
+The bootstrap tests inject transports and block sockets. They cover success/decline/empty/invalid/ambiguous/redirect CLI dispatcher paths, real CLI status/error exit codes, fake-clock expiry, persistence boundaries, and actual child-process exits around checkpoint fsync/rename. No live candidate or operational state is used. Run `npm.cmd run test:bootstrap`, `npm.cmd run test:peer`, and `npm.cmd test`; the full suite also includes native-GET request-bound tests.
 
 ## Remaining live-pilot blockers
 
