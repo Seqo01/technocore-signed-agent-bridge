@@ -19,6 +19,8 @@ import { validatePeerWindow, classifyEffectObservation } from "../src/swarm/peer
 import { offlinePeerInference } from "../src/swarm/offline-inference.js";
 import { PeerEffectReconciliation } from "../src/swarm/effect-reconciliation.js";
 import { peerSessionCommand } from "../src/swarm/cli.js";
+import { readOperatorTask, validateOperatorTask, validateFlow, type OperatorTask } from "../src/swarm/operator-task.js";
+import { operatorView } from "../src/swarm/operator-view.js";
 import { ExternalJobDelivery } from "../src/swarm/external-delivery.js";
 import { DeterministicInferenceProvider } from "../src/agent/inference.js";
 import { InferenceLedger, defaultInferenceBudgets } from "../src/agent/inference-accounting.js";
@@ -76,6 +78,175 @@ function input(type: string): Record<string, unknown> {
   return validateWorkRequest(type, values[type]!);
 }
 const defaultWork: Record<PeerAlias, string> = { alice: "workload.coordination", bob: "workload.research", charlie: "workload.engineering", dave: "workload.review", eve: "workload.specialist" };
+function operatorTask(flow: PeerAlias[] = ["bob"]): OperatorTask {
+  return { objective: "Assess the supplied sequence rule", source: "L1: Sequence numbers increase for each accepted message.",
+    acceptanceCriteria: ["Reference L1", "Distinguish unestablished persistence guarantees"], flow };
+}
+async function reopen(f: Awaited<ReturnType<typeof fixture>>) {
+  return SwarmSessionSupervisor.resume({ root: f.tmp.path, policy: f.policy, reviewedPolicyHash: hashValue(f.policy), passphrases: secrets.provider });
+}
+for (const flow of [["bob"], ["charlie"], ["eve"], ["bob", "dave"], ["charlie", "dave"], ["alice", "bob", "eve"]] as PeerAlias[][]) {
+  test(`operator flow ${flow.join(" -> ")} uses only selected roles and persisted evidence`, async () => {
+    const f = await fixture(); const s = await f.start();
+    try {
+      const root = await s.submitOperator(operatorTask(flow)); await untilIdle(s);
+      const state = s.snapshot(), job = state.jobs[state.tasks[root]!.jobId]!;
+      assert.equal(job.status, "completed"); assert.equal(job.tasks.length, flow.length);
+      assert.deepEqual(job.tasks.map(id => state.tasks[id]!.alias), flow);
+      assert.equal(state.budgets.inference, flow.length);
+      assert.equal(await s.submitOperator(operatorTask(flow)), root);
+      assert.equal(s.snapshot().budgets.inference, flow.length);
+      const view = await operatorView(f.tmp.path, f.policy.sessionId, job.id);
+      assert.equal(view.inference.attempts, flow.length); assert.equal(view.testingOnly, true);
+      for (const task of view.tasks) { assert.ok(task.result); assert.ok(task.provenance); }
+      if (flow.includes("dave")) {
+        assert.equal(view.tasks.find(t => t.agent === "dave")!.reviewOutcome, "REVISION_REQUIRED");
+        const node = Object.values(state.tasks).find(t => t.alias === "dave")!;
+        assert.equal(node.input.expectedOutputHash, hashValue(node.input.producedResult));
+        assert.ok(String(node.input.question).includes(operatorTask().source!));
+      }
+    } finally { await s.stop(); await f.tmp.cleanup(); }
+  });
+}
+for (const flow of [[], ["dave"], ["bob", "eve"], ["bob", "bob"], ["alice", "dave", "bob"], ["unknown"]]) {
+  test(`operator rejects unsupported role flow ${JSON.stringify(flow)}`, () => assert.throws(() => validateFlow(flow)));
+}
+test("operator validates bounded input, secret-like source and malformed files without execution", async () => {
+  for (const value of [null, [], {}, { ...operatorTask(), objective: "x".repeat(513) }, { ...operatorTask(), source: "x".repeat(2049) },
+    { ...operatorTask(), acceptanceCriteria: [] }, { ...operatorTask(), unexpected: true }, { ...operatorTask(), source: '"passphrase":"fixture"' }]) {
+    assert.throws(() => validateOperatorTask(value));
+  }
+  const tmp = await temporaryDirectory();
+  try {
+    await atomicWriteJson(resolve(tmp.path, "task.json"), { ...operatorTask(), source: undefined, sourceFile: "source.json" });
+    await atomicWriteJson(resolve(tmp.path, "source.json"), { text: "Operator-provided local source" });
+    assert.match((await readOperatorTask(resolve(tmp.path, "task.json"))).source!, /Operator-provided/);
+    await atomicWriteJson(resolve(tmp.path, "source.json"), { text: "x".repeat(2049) });
+    await assert.rejects(readOperatorTask(resolve(tmp.path, "task.json")));
+    await atomicWriteJson(resolve(tmp.path, "bad.json"), "x".repeat(9000));
+    await assert.rejects(readOperatorTask(resolve(tmp.path, "bad.json")));
+  } finally { await tmp.cleanup(); }
+});
+test("operator pause queues no new compute, stop/reopen same session continues eligible Bob -> Dave exactly once", async () => {
+  const f = await fixture(); let s = await f.start();
+  try {
+    const root = await s.submitOperator(operatorTask(["bob", "dave"]));
+    await s.step(); // Bob's result checkpoint; no mock message exists yet.
+    await s.pause(); assert.equal(s.snapshot().lifecycle, "paused");
+    assert.equal(await s.step(), false); assert.equal(s.snapshot().budgets.inference, 1);
+    const before = s.snapshot(); await s.stop(); s = await reopen(f); await untilIdle(s);
+    assert.equal(s.snapshot().sessionId, before.sessionId); assert.equal(s.snapshot().createdAt, before.createdAt);
+    assert.equal(s.snapshot().jobs[before.tasks[root]!.jobId]!.status, "completed");
+    assert.equal(s.snapshot().budgets.inference, 2);
+    await s.stop(); s = await reopen(f); await untilIdle(s);
+    assert.equal(s.snapshot().budgets.inference, 2);
+    assert.equal((await operatorView(f.tmp.path, f.policy.sessionId)).inference.attempts, 2);
+  } finally { await s.stop(); await f.tmp.cleanup(); }
+});
+test("pause waits for a currently bounded operation checkpoint and explicit continue releases queued work", async () => {
+  const f = await fixture(); let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(r => { entered = r; }), gate = new Promise<void>(r => { finish = r; });
+  const base = offlinePeerInference();
+  const inference = { name: base.name, infer: async (...args: Parameters<typeof base.infer>) => { entered(); await gate; return base.infer(...args); } };
+  const s = await SwarmSessionSupervisor.start({ root: f.tmp.path, policy: f.policy, reviewedPolicyHash: hashValue(f.policy), passphrases: secrets.provider, inference });
+  try {
+    await s.submitOperator(operatorTask()); const operation = s.step(); await started;
+    const paused = s.pause(); assert.equal(s.snapshot().lifecycle, "active");
+    finish(); await operation; await paused;
+    assert.equal(s.snapshot().lifecycle, "paused"); assert.equal(s.snapshot().budgets.inference, 1);
+    assert.equal(await s.step(), false); await s.continue(); assert.equal(s.snapshot().lifecycle, "active");
+  } finally { finish(); await s.stop(); await f.tmp.cleanup(); }
+});
+for (const state of ["queued", "completed", "failed", "cancelled", "ambiguous"] as const) {
+  test(`offline reopen preserves ${state} work and never duplicates inference`, async () => {
+    const f = await fixture(); let s = await f.start();
+    try {
+      const root = await s.submitOperator(operatorTask());
+      if (state === "completed") await untilIdle(s);
+      if (state === "failed" || state === "cancelled") {
+        const paths = resolve(sessionDirectory(f.tmp.path, f.policy.sessionId), "agents", "bob", "state.json");
+        const data = JSON.parse(await readFile(paths, "utf8")); data.tasks[root].status = state; data.tasks[root].attempts = 1;
+        await atomicWriteJson(paths, data);
+      }
+      const history = s.snapshot().createdAt; await s.stop();
+      if (state === "ambiguous") {
+        const path = resolve(sessionDirectory(f.tmp.path, f.policy.sessionId), "session.json");
+        const data = JSON.parse(await readFile(path, "utf8")); data.tasks[root].compute = "running"; await atomicWriteJson(path, data);
+      }
+      s = await reopen(f); await untilIdle(s);
+      assert.equal(s.snapshot().createdAt, history);
+      assert.equal(s.snapshot().tasks[root]!.compute, state === "queued" || state === "completed" ? "result-ready" : state === "cancelled" ? "failed" : state);
+      const count = state === "queued" || state === "completed" ? 1 : 0;
+      assert.equal((await operatorView(f.tmp.path, f.policy.sessionId)).inference.attempts, count);
+      await assert.rejects(reopen(f), /already active/);
+      await s.stop(); s = await reopen(f); await untilIdle(s);
+      assert.equal((await operatorView(f.tmp.path, f.policy.sessionId)).inference.attempts, count);
+    } finally { await s.stop(); await f.tmp.cleanup(); }
+  });
+}
+test("offline reopen never assumes an unreceived in-memory message survived shutdown", async () => {
+  const f = await fixture(); let s = await f.start();
+  try {
+    const root = await s.submitOperator(operatorTask(["bob", "dave"])); await s.step(); await s.step();
+    assert.equal(Object.values(s.snapshot().effects)[0]!.status, "sent");
+    const attempts = s.snapshot().budgets; await s.stop(); s = await reopen(f); await untilIdle(s);
+    assert.deepEqual(s.snapshot().budgets, attempts);
+    const job = s.snapshot().jobs[s.snapshot().tasks[root]!.jobId]!;
+    assert.equal(job.status, "needs-operator"); assert.match(job.blockedReason!, /not-retained/);
+    assert.equal(Object.values(s.snapshot().effects)[0]!.status, "ambiguous");
+  } finally { await s.stop(); await f.tmp.cleanup(); }
+});
+test("configured/live sessions cannot use offline resume", async () => {
+  const f = await fixture();
+  try { await assert.rejects(SwarmSessionSupervisor.resume({ root: f.tmp.path, policy: { ...f.policy, mode: "configured" }, reviewedPolicyHash: hashValue(f.policy), passphrases: secrets.provider }), /OFFLINE/); }
+  finally { await f.tmp.cleanup(); }
+});
+test("operator CLI runs submission, pause, result and stop against the real offline loop without Codex", async () => {
+  const f = await fixture(); const before = await snapshotInputs(f.tmp.path);
+  const oldRoot = process.env.TECHNOCORE_HOME, log = console.log;
+  const output: string[] = []; let s: SwarmSessionSupervisor | undefined, running: Promise<void> | undefined;
+  console.log = (...args: unknown[]) => { output.push(args.map(String).join(" ")); };
+  async function waitFor(condition: () => boolean | Promise<boolean>) {
+    for (let i = 0; i < 400; i++) { if (await condition()) return; await new Promise(r => setTimeout(r, 25)); }
+    assert.fail("bounded offline CLI wait expired");
+  }
+  try {
+    process.env.TECHNOCORE_HOME = f.tmp.path;
+    const policyFile = resolve(f.tmp.path, "operator-policy.json");
+    await peerSessionCommand("swarm:policy", [policyFile, "--session", "cli-operator", "--flow", "bob,dave"]);
+    const policy = JSON.parse(await readFile(policyFile, "utf8")) as SessionPolicy;
+    assert.equal(policy.pairs.length, 2); assert.equal(policy.mode, "offline");
+    s = await SwarmSessionSupervisor.start({ root: f.tmp.path, policy, reviewedPolicyHash: hashValue(policy), passphrases: secrets.provider });
+    running = s.run();
+    await peerSessionCommand("swarm:pause", [policy.sessionId]); await waitFor(() => s!.snapshot().lifecycle === "paused");
+    const taskFile = resolve(f.tmp.path, "operator-task.json"); await atomicWriteJson(taskFile, operatorTask(["bob", "dave"]));
+    await peerSessionCommand("swarm:task", [taskFile, "--session", policy.sessionId]);
+    const submitted = JSON.parse(output.at(-1)!) as { jobId: string };
+    await peerSessionCommand("swarm:task", [taskFile, "--session", policy.sessionId]);
+    await peerSessionCommand("swarm:status", [policy.sessionId]);
+    assert.equal(JSON.parse(output.at(-1)!).counts.queuedSubmissions, 1);
+    assert.equal(s.snapshot().budgets.inference, 0);
+    await peerSessionCommand("swarm:continue", [policy.sessionId]);
+    await waitFor(() => s!.snapshot().jobs[submitted.jobId]?.status === "completed");
+    await peerSessionCommand("swarm:result", [policy.sessionId, submitted.jobId]);
+    const result = JSON.parse(output.at(-1)!);
+    assert.equal(result.inference.attempts, 2); assert.equal(result.counts.revisionRequired, 1);
+    await peerSessionCommand("swarm:pause", [policy.sessionId]); await waitFor(() => s!.snapshot().lifecycle === "paused");
+    await peerSessionCommand("swarm:stop", [policy.sessionId]); await running;
+    assert.equal(s.snapshot().lifecycle, "stopped");
+    assert.deepEqual(await snapshotInputs(f.tmp.path), before);
+    for (const alias of peerAliases) {
+      assert.equal(output.join("\n").includes((await f.stores.mailboxes.load(alias)).room), false);
+      const encrypted = JSON.parse(await readFile(resolve(f.stores.paths.identities, `${alias}.json`), "utf8"));
+      assert.equal(output.join("\n").includes(encrypted.encryptedPrivateKey.ciphertext), false);
+    }
+    assert.equal(output.join("\n").includes(secrets.passphrase.toString("hex")), false);
+  } finally {
+    if (s) await s.stop(); await running;
+    console.log = log; if (oldRoot === undefined) delete process.env.TECHNOCORE_HOME; else process.env.TECHNOCORE_HOME = oldRoot;
+    await f.tmp.cleanup();
+  }
+});
 function proposal(p: SessionPolicy, alias: PeerAlias, requester = p.members.find(m => m.alias === alias)!.did): WorkProposal {
   const workloadType = defaultWork[alias], payload = input(workloadType);
   return { version: 1, kind: "peer-work", proposalId: `root_${alias}`, requesterDid: requester, recipientDid: p.members.find(m => m.alias === alias)!.did,

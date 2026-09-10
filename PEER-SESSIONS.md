@@ -17,6 +17,136 @@ verification is limited to the supplied result hash; deterministic fixtures are
 never live verification. No model receives signing, approval, shell, policy,
 identity, nonce, cursor, wallet or commerce APIs.
 
+## Standalone offline operator workflow
+
+This is a normal Node application: build it, close Codex, and use two ordinary
+PowerShell terminals. Codex is not a runtime dependency. There is no model install,
+API credential, browser, cloud service, dashboard, or network requirement.
+**Deterministic inference is testing only.** It exercises persistence and review
+routing; it does not meaningfully analyze your source or earn inference spend.
+The fixture reviewer reports `REVISION_REQUIRED`, not fabricated verification.
+
+Prerequisites are the five existing encrypted identity/role/mailbox bindings.
+Only selected roles perform tasks. The existing supervisor loads/unlocks all five
+runtimes; enter each passphrase only in its hidden local terminal prompt.
+For a multi-role flow, both directional contacts for each adjacent pair must
+already exist and match the existing mailboxes. Policy preparation fails if a
+contact is missing; it never creates contacts, trust, mailboxes or identities.
+No full mesh is needed. A single-role flow needs no pair contacts.
+
+First build, then create an **offline-only** bounded policy from those existing
+bindings. Inspect the local policy before starting. The start command computes
+the policy hash unless an explicit `--policy-hash` is supplied.
+
+```powershell
+npm.cmd run build
+node .\dist\src\cli.js swarm:policy .\.technocore\offline-policy.json --session offline-product-smoke --flow bob,dave
+node .\dist\src\cli.js swarm:start --offline --policy .\.technocore\offline-policy.json
+```
+
+`swarm:policy` atomically creates (never overwrites) the file. Its policy grants
+only the selected flow's workloads and adjacent directional pairs, with 32 task,
+inference, simulated-send and simulated-read limits, serial operation, and a
+23-hour expiry. No intake polling is enabled. Nothing is sent to Technocore.
+The original expiry/budgets are **not renewed** by resume. Expired sessions
+remain readable but cannot resume in this milestone.
+
+In the second terminal create `.technocore/operator-task.json` with your own
+objective, criteria and optional local source. Example file structure:
+
+```json
+{
+  "objective": "Identify guarantees and limitations in the supplied naming validator",
+  "sourceFile": "source-excerpt.txt",
+  "acceptanceCriteria": [
+    "Reference the supplied source lines for every claim",
+    "Distinguish explicit checks from behavior not established by this excerpt"
+  ],
+  "flow": ["bob", "dave"]
+}
+```
+
+`sourceFile` is resolved relative to the task file, read once and snapshotted;
+later edits do not change the queued task. Alternatively use inline `source`,
+but not both. Only UTF-8 regular files are accepted; no URL fetching, shell/code
+execution, source instructions, or automatic task generation occurs. Bounds:
+task JSON 8192 bytes; source file 2048 bytes; inline source 2048 characters;
+objective 512 characters; 1–8 criteria of at most 256 characters each. The
+combined task and generated peer envelope must also fit the existing session
+payload limit (4096 bytes); these are not independently additive allowances.
+Secret-like input is rejected without printing it. Oversized downstream review
+input is blocked explicitly; no new inference or delivery is invented.
+
+Supported role flows: `bob`, `bob,dave`, `charlie`, `charlie,dave`, `eve`, or
+`alice` followed by explicitly selected distinct roles. Dave, when selected,
+must be last. Alice-led flows are an explicit sequential chain, not AI routing.
+For example `alice,bob,eve` runs only those three roles. No role repeats in v1.
+The chosen policy must permit the entire flow before submission is accepted.
+
+```powershell
+$submitted = node .\dist\src\cli.js swarm:task .\.technocore\operator-task.json --session offline-product-smoke | ConvertFrom-Json
+node .\dist\src\cli.js swarm:status offline-product-smoke
+node .\dist\src\cli.js swarm:result offline-product-smoke $submitted.jobId
+```
+
+The result command is available after the running process accepts the submission;
+status shows queued/accepted/rejected submission receipts. Repeating identical
+input in the same session is idempotent: it does not create another job. Operator
+flows use the existing `submit/delegate` DAG, memory, evidence and accounting.
+Dave receives the actual persisted parent output/hash, the same fixed source,
+and the operator's acceptance criteria. Review completion is distinct from VOUCH.
+
+Result inspection reports persisted task/job IDs, flow, statuses, results,
+review findings, timestamps, and evidence/accounting references. Status derives
+agent/current-task views, queued/completed/failed/ambiguous/revision counts,
+external job counts and recent journal activity from existing records. Inference
+totals are explicitly **session-scoped**, even when viewing one job. No uptime
+across restarts or useful/FLOP spend is claimed. These views never unlock keys.
+
+```powershell
+node .\dist\src\cli.js swarm:pause offline-product-smoke
+node .\dist\src\cli.js swarm:status offline-product-smoke
+node .\dist\src\cli.js swarm:continue offline-product-smoke
+node .\dist\src\cli.js swarm:stop offline-product-smoke
+```
+
+Pause is requested asynchronously. Wait for status `PAUSED`: the current bounded
+operation reaches its checkpoint, but no new queued work starts. Submissions may
+queue while paused. Continue resumes that same running process. Stop works while
+running or paused and releases the runtimes. It does not fabricate cancellation.
+After the first terminal exits, explicitly reopen there (interactive unlock):
+
+```powershell
+node .\dist\src\cli.js swarm:resume offline-product-smoke
+```
+
+Completed results and the original session/history survive. Failed/cancelled
+tasks are not retried; interrupted/ambiguous work is blocked. Never-started queued
+compute may continue. A second concurrent resume is refused; stop/reopen cycles
+do not repeat computation/accounting. An unfinished root-intake checkpoint is
+blocked rather than re-enqueued with guessed intent.
+
+Offline messages were in memory, not durable network receipts. Unreceived effects
+become explicitly blocked/ambiguous after restart. New delivery into a room whose
+earlier mock history was lost is also blocked; durable cursors are not reset.
+For example, pause/stop immediately after Bob's local result but **before any
+mock send** permits Dave's queued flow to continue on reopen. Stopping midway
+through simulated delivery may instead require operator attention. The finished
+job remains inspectable in either case. No live session resume or automatic
+reconciliation is added.
+
+Offline regression checks:
+
+```powershell
+npm.cmd run test:peer
+npm.cmd test
+npm.cmd run typecheck
+npm.cmd run build
+```
+
+All test identities/state are temporary; tests prohibit live sockets. No real
+identity, contact, historical rehearsal or discovery data is test input.
+
 ## Architecture and lifecycle
 
 ```text
@@ -40,8 +170,12 @@ startup closes all runtimes already opened and performs no transport operation.
 The supervisor initializes **new session profiles**, not new identities, under
 `.technocore/swarm/sessions/<session-id>/agents/<alias>/`. Historical agent tasks,
 rehearsals, approvals and reconciliation records are not loaded as session work.
-An existing session ID cannot be restarted, even after clean shutdown. A dead
-session is reported as interrupted/needs-operator; authority is not reactivated.
+`swarm:start` never overwrites an existing session. `swarm:resume` explicitly
+reopens the same **offline** session while its original policy is unexpired.
+It retains history and budgets, never repeats terminal computation, and blocks
+work whose offline delivery cannot be reconstructed. Configured/live resume is
+not supported. A dead process remains interrupted/needs-operator until an
+explicit offline reopen; status inspection never reactivates authority.
 
 All mailbox readers made with the standard `createStores` path share a non-TTL
 ownership lock with sessions. A session owns each physical mailbox for its lifetime;
@@ -154,7 +288,7 @@ nonce or action. `not-observed` is never proof of non-commit. A matching observa
 still requires an operator decision; no recovery API silently restarts authority.
 
 Already retained data can be classified completely offline via `observeRetained`
-or the pure receipt classifier. Explicit restart/local-apply authorization is not
+or the pure receipt classifier. Configured/live restart/local-apply authorization is not
 implemented in this iteration. Existing runtime evidence remains durable for a
 future operator-reviewed continuation; no historical recovery implementation was
 removed or run.
@@ -178,8 +312,9 @@ Recommended first run, **only generated temporary identities and no live request
 npm.cmd run test:peer
 ```
 
-These commands are implemented; placeholders require a deliberately prepared local
-policy/proposal. No real operational policy is generated by the implementation:
+These lower-level commands remain available; placeholders require a deliberately
+prepared local policy/proposal. The operator workflow above can prepare an
+offline policy and task hashes without editing code. It does not generate live authority:
 
 ```powershell
 node .\dist\src\cli.js swarm:start --offline --policy <policy-file> --policy-hash <reviewed-hash>

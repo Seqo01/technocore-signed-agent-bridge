@@ -37,7 +37,8 @@ function usage(): never {
     "bootstrap:send <id> <action-hash> | bootstrap:receive <id> | bootstrap:timeout <id> | bootstrap:proposal <id> | " +
     "external:jobs <session> | external:response-prepare <session> <proposal-record> <result-node> | " +
     "external:response-status <session> <effect> | external:response-authorize <session> <effect> <action-hash> | external:response-send <session> <effect> <action-hash> | " +
-    "swarm:start --offline --policy <file> --policy-hash <hash> | swarm:status <id> | swarm:stop <id> | " +
+    "swarm:policy <file> --session <id> --flow bob,dave | swarm:start --offline --policy <file> [--policy-hash <hash>] | " +
+    "swarm:task <file> --session <id> | swarm:result <session> <job> | swarm:status <id> | swarm:pause <id> | swarm:continue <id> | swarm:stop <id> | swarm:resume <id> | " +
     "peer:capabilities <alias> --policy <file> --policy-hash <hash> | peer:submit <alias> <file> --session <id> | " +
     "identity:migrate <name> --backup <path> | identity:restore <name> --backup <path> | " +
     "agent:init <existing-identity> | agent:role <alias> <role> <expected-did> | " +
@@ -101,7 +102,7 @@ async function main(): Promise<void> {
     }
     console.log(JSON.stringify(await new InferenceLedger(resolve(args[0])).summary(filter), null, 2)); return;
   }
-  if (["swarm:start", "swarm:status", "swarm:stop", "peer:capabilities", "peer:submit"].includes(command)) {
+  if (["swarm:policy", "swarm:start", "swarm:status", "swarm:stop", "swarm:task", "swarm:result", "swarm:pause", "swarm:continue", "swarm:resume", "peer:capabilities", "peer:submit"].includes(command)) {
     await peerSessionCommand(command, args); return;
   }
   const { paths: _paths, ...stores } = createStores(undefined, hiddenPassphraseProvider);

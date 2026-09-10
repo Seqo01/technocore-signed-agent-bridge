@@ -5,6 +5,7 @@ import { hashValue } from "../agent/util.js";
 import type { TaskEvidence } from "../agent/evidence.js";
 import type { OutboundDiagnostics } from "../send-diagnostics.js";
 import type { WorkProposal } from "./proposal.js";
+import type { OperatorTask } from "./operator-task.js";
 import { assertId } from "./proposal.js";
 import { assertSessionId, type PeerAlias, type RootProvenance, type SessionPolicy } from "./session-policy.js";
 
@@ -16,7 +17,7 @@ export interface PeerTask {
   delivery: "local" | "planned" | "send-prepared" | "sending" | "sent" | "received" | "needs-operator";
   evidence?: TaskEvidence;
 }
-export interface PeerJob { id: string; root: RootProvenance; rootHash: string; tasks: string[]; status: "accepted" | "running" | "completed" | "needs-operator" }
+export interface PeerJob { id: string; root: RootProvenance; rootHash: string; tasks: string[]; status: "accepted" | "running" | "completed" | "needs-operator"; operator?: OperatorTask; blockedReason?: string }
 export interface PeerEffect {
   id: string; taskId: string; source: PeerAlias; target: PeerAlias; kind: "proposal" | "result";
   actionId: string; payloadHash: string; destinationHash: string; authorityId: string;
@@ -30,7 +31,7 @@ export interface ProposalRecord {
 }
 export interface PeerSession {
   version: 1; sessionId: string; policyHash: string; policy: SessionPolicy; pid: number;
-  lifecycle: "starting" | "active" | "stopping" | "stopped" | "halted"; reason?: string;
+  lifecycle: "starting" | "active" | "paused" | "stopping" | "stopped" | "halted"; reason?: string;
   createdAt: string; updatedAt: string;
   budgets: { tasks: number; outbound: number; gets: number; inference: number };
   jobs: Record<string, PeerJob>; tasks: Record<string, PeerTask>; effects: Record<string, PeerEffect>;
@@ -41,7 +42,9 @@ export interface PeerSession {
 export function sessionDirectory(root: string, id: string): string { assertSessionId(id); return resolve(root, "swarm", "sessions", id); }
 export class SessionStateStore {
   private expectedHash: string | undefined;
-  constructor(readonly directory: string, readonly value: PeerSession) {}
+  constructor(readonly directory: string, readonly value: PeerSession, existing = false) {
+    if (existing) this.expectedHash = hashValue(value);
+  }
   async save(): Promise<void> {
     const path = resolve(this.directory, "session.json");
     const current = await readJsonFile<PeerSession | null>(path, null);

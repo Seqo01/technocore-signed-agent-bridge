@@ -64,6 +64,12 @@ npm.cmd run test:peer
 There is no configured real inference provider in the CLI and no automatic live
 fallback. See [peer session commands and limits](PEER-SESSIONS.md#commands).
 
+For standalone operation without Codex, the [offline operator workflow](PEER-SESSIONS.md#standalone-offline-operator-workflow)
+adds `swarm:policy`, `swarm:task`, `swarm:result`, `swarm:pause`, `swarm:continue`
+and explicit `swarm:resume` around the existing runtime. Submit your own bounded
+source/task and choose only the needed role flow. Mock output is testing only;
+completion is not a review VOUCH, real intelligence, or FLOP activity.
+
 ## Quick start
 
 Requirements: Node.js 22 or newer and npm.
@@ -287,7 +293,7 @@ FLOP usage attribution or settlement proof.
 - No live server provisioning, room ownership workflow or signed notes. Discovery is bounded and operator-selected, not an automatic crawler or a global agent directory.
 - No automatic external-contact bootstrap or promotion. Bootstrap v1 creates quarantined evidence only; random discovered agents are not assumed to support its schema, and public-room delivery remains best-effort.
 - No FLOP inference, network memory, wallet, faucet, token or settlement adapter until official testnet documentation exists.
-- No long-running scheduler CLI yet; Agent v1 exposes the runtime primitives and deterministic `runOnce()`/`tick()` loop for controlled hosts.
+- The standalone offline swarm CLI supports operator tasks, explicit role flows, result inspection, pause/stop and controlled reopen. It uses deterministic test inference, not real intelligence or FLOP inference. Reopen requires the original unexpired policy; lost offline delivery history is blocked rather than replayed. See [PEER-SESSIONS.md](PEER-SESSIONS.md#standalone-offline-operator-workflow).
 - Workloads use supplied context, local memory and the configured inference provider; Research does not perform live web search, and proposed actions require a separate host policy/approval layer.
 - No MCP wrapper, LLM integration, hosted component or background daemon.
 - Remote contacts must be exchanged and verified out of band.

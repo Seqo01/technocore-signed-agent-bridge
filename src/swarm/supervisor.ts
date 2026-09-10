@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AgentRuntime } from "../agent/runtime.js";
 import { AgentStateStore } from "../agent/state-store.js";
@@ -25,6 +25,7 @@ import { SessionAuthority, peerAliases, pairId, schemaId, type SessionPolicy, ty
 import { SessionStateStore, sessionDirectory, validateDag, type PeerTask, type PeerEffect, type PeerSession, type ProposalRecord } from "./session-state.js";
 import { validatePeerWindow, classifyEffectObservation } from "./peer-recovery.js";
 import { offlinePeerInference } from "./offline-inference.js";
+import { operatorInput, operatorWorkload, validateOperatorTask, validateOperatorAuthority, type OperatorTask } from "./operator-task.js";
 
 export interface PeerSessionOptions {
   root: string; policy: SessionPolicy; reviewedPolicyHash: string; passphrases: PassphraseProvider;
@@ -54,30 +55,59 @@ export class SwarmSessionSupervisor {
   private readOwner: PeerAlias | undefined;
   private stopRequested = false;
   private closed = false;
+  private pauseRequested = false;
+  private readonly lostOfflineRooms = new Set<string>();
   private turn = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly now: () => number;
 
-  private constructor(options: PeerSessionOptions, authority: SessionAuthority) {
+  private constructor(options: PeerSessionOptions, authority: SessionAuthority, restored?: PeerSession) {
     this.authority = authority; this.now = options.now ?? Date.now;
     this.originals = createStores(options.root, options.passphrases);
     const directory = sessionDirectory(this.originals.paths.root, authority.policy.sessionId);
     const createdAt = new Date(this.now()).toISOString();
-    this.store = new SessionStateStore(directory, { version: 1, sessionId: authority.policy.sessionId, policyHash: authority.hash,
+    this.store = new SessionStateStore(directory, restored ?? { version: 1, sessionId: authority.policy.sessionId, policyHash: authority.hash,
       policy: structuredClone(authority.policy), pid: process.pid, lifecycle: "starting", createdAt, updatedAt: createdAt,
-      budgets: { tasks: 0, outbound: 0, gets: 0, inference: 0 }, jobs: {}, tasks: {}, effects: {}, proposals: {}, receipts: {}, recovery: {}, intake: {} });
+      budgets: { tasks: 0, outbound: 0, gets: 0, inference: 0 }, jobs: {}, tasks: {}, effects: {}, proposals: {}, receipts: {}, recovery: {}, intake: {} }, !!restored);
     this.transport = authority.policy.mode === "offline" ? options.offlineTransport ?? new InMemoryTechnocoreTransport() :
       new HttpTechnocoreTransport(authority.policy.network.origin, { readRetries: 0, rateLimitRetries: 0, readRedirect: "error", writeTimeoutMs: 30000 });
   }
   static async start(options: PeerSessionOptions): Promise<SwarmSessionSupervisor> {
+    return this.open(options);
+  }
+  static async resume(options: PeerSessionOptions): Promise<SwarmSessionSupervisor> {
+    if (options.policy.mode !== "offline") throw new BridgeError("Only OFFLINE sessions may be reopened");
+    const state = await SessionStateStore.read(options.root, options.policy.sessionId);
+    if (state.policy.mode !== "offline" || state.policyHash !== options.reviewedPolicyHash) throw new BridgeError("Offline resume authority mismatch");
+    if (!["stopped", "halted"].includes(state.lifecycle)) {
+      let live = false; try { process.kill(state.pid, 0); live = true; } catch { /* Dead process: classify persisted work below. */ }
+      if (live) throw new BridgeError("Session process is already active; use continue for a paused session");
+    }
+    return this.open(options, state);
+  }
+  private static async open(options: PeerSessionOptions, restored?: PeerSession): Promise<SwarmSessionSupervisor> {
     const authority = new SessionAuthority(options.policy, options.reviewedPolicyHash, options.now);
     if (authority.policy.mode === "configured" && (!options.inference || options.inference.name === "deterministic-local" || options.offlineTransport)) throw new BridgeError("Configured real inference provider required; no offline fallback");
     if (authority.policy.mode === "offline" && options.inference && options.inference.name !== "deterministic-local") throw new BridgeError("Offline session requires an explicitly deterministic provider");
-    const s = new SwarmSessionSupervisor(options, authority);
+    const s = new SwarmSessionSupervisor(options, authority, restored);
     await ensurePrivateDirectory(resolve(s.store.directory, ".."));
-    try { await mkdir(s.store.directory, { mode: 0o700 }); }
-    catch { throw new BridgeError("Session id already exists; automatic resume is forbidden"); }
+    if (!restored) {
+      try { await mkdir(s.store.directory, { mode: 0o700 }); }
+      catch { throw new BridgeError("Session id already exists; automatic resume is forbidden"); }
+    }
+    // One process owns the durable session even while identities are being unlocked.
+    s.owners.push(await AgentRuntimeLock.acquire(resolve(s.store.directory, "session.lock")));
     try {
+      if (restored) {
+        if (hashValue(await SessionStateStore.read(options.root, restored.sessionId)) !== hashValue(restored)) throw new BridgeError("Session changed before reopen");
+        validateDag(restored.tasks);
+        for (const e of Object.values(restored.effects)) s.lostOfflineRooms.add(e.target);
+        s.data.pid = process.pid; s.data.lifecycle = "starting";
+        delete s.data.reason;
+        for (const file of ["stop.json", "pause.json", "continue.json"]) {
+          await unlink(resolve(s.store.directory, file)).catch((e: NodeJS.ErrnoException) => { if (e.code !== "ENOENT") throw e; });
+        }
+      }
       // All public bindings and contacts validated before the first unlock; no synthetic replacements.
       for (const member of authority.policy.members) {
         const identity = await s.originals.identities.inspect(member.alias);
@@ -117,6 +147,7 @@ export class SwarmSessionSupervisor {
         if (!node || node.compute !== "planned") throw new BridgeError("Delegation is not bound to an accepted session DAG node");
         s.authorizeNode(node);
       });
+      if (restored) await s.restoreOfflineTasks();
       s.data.lifecycle = "active"; s.authority.capabilities.availability("available"); await s.store.save();
       return s;
     } catch {
@@ -127,6 +158,47 @@ export class SwarmSessionSupervisor {
   }
   private get data(): PeerSession { return this.store.value; }
   snapshot(): PeerSession { return structuredClone(this.data); }
+  private async restoreOfflineTasks(): Promise<void> {
+    for (const e of Object.values(this.data.effects)) if (e.status !== "received") {
+      if (e.status !== "failed") e.status = "ambiguous";
+      const node = this.data.tasks[e.taskId]!;
+      node.delivery = "needs-operator";
+      this.data.jobs[node.jobId]!.status = "needs-operator";
+      this.data.jobs[node.jobId]!.blockedReason = "offline-delivery-not-retained-no-retry";
+    }
+    for (const node of Object.values(this.data.tasks)) {
+      if (node.compute === "planned" && !node.parentId) {
+        node.compute = "ambiguous";
+        this.data.jobs[node.jobId]!.status = "needs-operator";
+        this.data.jobs[node.jobId]!.blockedReason = "root-intake-checkpoint-incomplete";
+      }
+      if (!["accepted", "running"].includes(node.compute)) continue;
+      const runtime = this.runtime(node.alias);
+      const task = (await runtime.state.load()).tasks[node.runtimeTaskId ?? ""];
+      if (task?.status === "succeeded") { node.evidence = await runtime.exportTaskEvidence(task.id); node.compute = "result-ready"; }
+      else if (task && ["failed", "cancelled"].includes(task.status)) node.compute = "failed";
+      else if (!task || task.status !== "pending" || task.attempts !== 0 || node.compute === "running") node.compute = "ambiguous";
+      if (["failed", "ambiguous"].includes(node.compute)) {
+        this.data.jobs[node.jobId]!.status = "needs-operator";
+        this.data.jobs[node.jobId]!.blockedReason = "terminal-or-interrupted-compute-no-retry";
+      }
+    }
+    this.completeJobs();
+    await this.store.save();
+  }
+  pause(): Promise<void> {
+    if (this.authority.policy.mode !== "offline") return Promise.reject(new BridgeError("Pause helper is OFFLINE only"));
+    this.pauseRequested = true;
+    return this.serial(async () => {
+      if (this.data.lifecycle === "active") { this.data.lifecycle = "paused"; await this.store.save(); }
+    });
+  }
+  continue(): Promise<void> {
+    return this.serial(async () => {
+      if (this.data.lifecycle !== "paused" || this.closed || this.stopRequested) throw new BridgeError("Session is not paused");
+      this.authority.checkTime(); this.pauseRequested = false; this.data.lifecycle = "active"; await this.store.save();
+    });
+  }
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     const next = this.queue.then(operation); this.queue = next.catch(() => undefined); return next;
   }
@@ -232,12 +304,12 @@ export class SwarmSessionSupervisor {
   private async halt(reason: string): Promise<void> {
     this.data.lifecycle = "halted"; this.data.reason = reason; await this.store.save();
   }
-  private async rootTask(alias: PeerAlias, input: WorkProposal, root: RootProvenance): Promise<string> {
+  private async rootTask(alias: PeerAlias, input: WorkProposal, root: RootProvenance, operator?: OperatorTask): Promise<string> {
     this.budget("tasks"); this.authority.workload(this.authority.member(alias).did, input.workloadType);
     const jobId = hashValue({ session: this.data.sessionId, root: input.proposalId, requester: input.requesterDid });
     if (this.data.jobs[jobId]) throw new BridgeError("Root proposal already submitted; no duplicate job");
     const id = hashValue({ jobId, root: true }), rootHash = hashValue(root);
-    this.data.jobs[jobId] = { id: jobId, root: structuredClone(root), rootHash, tasks: [id], status: "accepted" };
+    this.data.jobs[jobId] = { id: jobId, root: structuredClone(root), rootHash, tasks: [id], status: "accepted", ...(operator ? { operator } : {}) };
     const node: PeerTask = { id, jobId, alias, workload: input.workloadType, input: structuredClone(input.input), inputHash: input.inputHash,
       dependencies: [], depth: 0, authorityChain: [this.authority.hash], rootHash, createdAt: new Date(this.now()).toISOString(), compute: "planned", delivery: "local" };
     this.data.tasks[id] = node; this.data.budgets.tasks++;
@@ -259,8 +331,28 @@ export class SwarmSessionSupervisor {
       return this.rootTask(alias, p, { requesterDid: p.requesterDid, origin: "internal", trust: "operator-local", originalProposalId: p.proposalId });
     });
   }
-  delegate(parentId: string, target: PeerAlias, workload: string, input: Record<string, unknown>, dependencies: string[] = [parentId]): Promise<string> {
+  submitOperator(value: OperatorTask): Promise<string> {
     return this.serial(async () => {
+      this.assertActive(); if (this.authority.policy.mode !== "offline") throw new BridgeError("Operator helper is OFFLINE only");
+      const task = validateOperatorTask(value), alias = task.flow[0]!;
+      const did = this.authority.member(alias).did;
+      const proposalId = hashValue({ session: this.data.sessionId, operator: task });
+      const existing = Object.values(this.data.jobs).find(j => j.root.originalProposalId === proposalId);
+      if (existing) return existing.tasks[0]!;
+      const root: RootProvenance = { requesterDid: did, origin: "internal", trust: "operator-local", originalProposalId: proposalId };
+      validateOperatorAuthority(this.authority, task);
+      const input = operatorInput(task, alias), workloadType = operatorWorkload[alias];
+      const p = validateProposal({ version: 1, kind: "peer-work", proposalId, requesterDid: did, recipientDid: did,
+        workloadType, workloadVersion: 1, objective: task.objective, input, inputHash: hashValue(input), evidenceRefs: [],
+        requestedOutputSchema: schemaId(workloadType, "output"), replyTo: did, createdAt: new Date(this.now()).toISOString(),
+        expiresAt: this.authority.policy.expiresAt, provenanceClaims: { mode: "offline" } }, this.authority.policy.limits.payloadBytes, this.now());
+      return this.rootTask(alias, p, root, task);
+    });
+  }
+  delegate(parentId: string, target: PeerAlias, workload: string, input: Record<string, unknown>, dependencies: string[] = [parentId]): Promise<string> {
+    return this.serial(() => this.delegateOwned(parentId, target, workload, input, dependencies));
+  }
+  private async delegateOwned(parentId: string, target: PeerAlias, workload: string, input: Record<string, unknown>, dependencies: string[] = [parentId]): Promise<string> {
       this.budget("tasks"); const parent = this.data.tasks[parentId];
       if (!parent || parent.alias === target || !dependencies.includes(parentId) || dependencies.some(id => this.data.tasks[id]?.jobId !== parent.jobId)) throw new BridgeError("Invalid task DAG parent/dependencies");
       const payload = validateWorkRequest(workload, input); safePeerText(payload, this.authority.policy.limits.payloadBytes);
@@ -274,7 +366,20 @@ export class SwarmSessionSupervisor {
       this.authorizeNode(node); this.budget("outbound"); this.budget("inference");
       validateDag({ ...this.data.tasks, [id]: node });
       this.data.tasks[id] = node; job.tasks.push(id); job.status = "running"; this.data.budgets.tasks++; await this.store.save(); return id;
-    });
+  }
+  private async advanceOperatorFlows(): Promise<void> {
+    for (const job of Object.values(this.data.jobs)) {
+      if (!job.operator || job.status === "needs-operator" || job.tasks.length >= job.operator.flow.length) continue;
+      const parent = this.data.tasks[job.tasks.at(-1)!]!;
+      if (["failed", "ambiguous"].includes(parent.compute) || parent.delivery === "needs-operator") {
+        job.status = "needs-operator"; job.blockedReason = "parent-work-not-successful"; await this.store.save(); continue;
+      }
+      if (parent.compute !== "result-ready" || !["local", "received"].includes(parent.delivery)) continue;
+      try {
+        const target = job.operator.flow[job.tasks.length]!;
+        await this.delegateOwned(parent.id, target, operatorWorkload[target], operatorInput(job.operator, target, parent.evidence));
+      } catch { job.status = "needs-operator"; job.blockedReason = "operator-flow-input-or-policy-rejected"; await this.store.save(); }
+    }
   }
   private proposalFor(node: PeerTask): WorkProposal {
     const parent = this.data.tasks[node.parentId!]!;
@@ -288,6 +393,12 @@ export class SwarmSessionSupervisor {
   private async send(node: PeerTask, kind: PeerEffect["kind"]): Promise<void> {
     const parent = this.data.tasks[node.parentId!]!;
     const source = kind === "proposal" ? parent.alias : node.alias, target = kind === "proposal" ? node.alias : parent.alias;
+    if (this.lostOfflineRooms.has(target)) {
+      node.delivery = "needs-operator";
+      this.data.jobs[node.jobId]!.status = "needs-operator";
+      this.data.jobs[node.jobId]!.blockedReason = "offline-room-history-not-retained-no-replay";
+      await this.store.save(); return;
+    }
     const text = safePeerText(kind === "proposal" ? this.proposalFor(node) : { version: 1, kind: "peer-result", taskId: node.id, jobId: node.jobId,
       requesterDid: this.authority.member(source).did, recipientDid: this.authority.member(target).did, resultHash: node.evidence!.resultHash,
       mode: this.authority.policy.mode }, this.authority.policy.limits.payloadBytes);
@@ -431,13 +542,15 @@ export class SwarmSessionSupervisor {
   }
   /** Fair serial scheduling is intentionally <= every configured concurrency bound. */
   step(): Promise<boolean> { return this.serial(async () => {
+    if (this.pauseRequested || this.data.lifecycle === "paused") return false;
     this.assertActive();
     try {
+      await this.advanceOperatorFlows();
       for (let offset = 0; offset < 5; offset++) {
         const alias = peerAliases[(this.turn + offset) % 5]!;
-        const receipt = Object.values(this.data.effects).find(e => e.target === alias && e.status === "sent");
+        const receipt = Object.values(this.data.effects).find(e => e.target === alias && e.status === "sent" && this.data.jobs[this.data.tasks[e.taskId]!.jobId]!.status !== "needs-operator");
         if (receipt) { this.turn = (this.turn + offset + 1) % 5; await this.receiveOwned(alias); return true; }
-        const node = Object.values(this.data.tasks).find(t => t.alias === alias &&
+        const node = Object.values(this.data.tasks).find(t => t.alias === alias && t.delivery !== "needs-operator" && this.data.jobs[t.jobId]!.status !== "needs-operator" &&
           ((t.compute === "planned" && t.dependencies.every(d => this.data.tasks[d]?.compute === "result-ready" && ["local", "received"].includes(this.data.tasks[d]!.delivery))) ||
             t.compute === "accepted" || (t.compute === "result-ready" && t.delivery === "planned")));
         if (!node) {
@@ -466,7 +579,7 @@ export class SwarmSessionSupervisor {
     } catch { await this.halt("policy-budget-or-persistence-needs-operator"); return false; }
   }); }
   private completeJobs(): void {
-    for (const job of Object.values(this.data.jobs)) if (job.tasks.every(id => this.data.tasks[id]!.compute === "result-ready" && ["local", "received"].includes(this.data.tasks[id]!.delivery))) job.status = "completed";
+    for (const job of Object.values(this.data.jobs)) if (job.status !== "needs-operator" && (!job.operator || job.tasks.length === job.operator.flow.length) && job.tasks.every(id => this.data.tasks[id]!.compute === "result-ready" && ["local", "received"].includes(this.data.tasks[id]!.delivery))) job.status = "completed";
   }
   /** Offline evidence classification only. Caller supplies an already retained observation; no GET/ACK/approval. */
   observeRetained(effectId: string, view: RoomResponse): Promise<void> {
@@ -481,8 +594,12 @@ export class SwarmSessionSupervisor {
     process.on("SIGINT", stop); process.on("SIGTERM", stop);
     const timer = setInterval(() => { void pathExists(resolve(this.store.directory, "stop.json")).then(exists => { if (exists) stop(); }).catch(stop); }, 250);
     try {
-      while (!this.stopRequested && this.data.lifecycle === "active") {
+      while (!this.stopRequested && ["active", "paused"].includes(this.data.lifecycle)) {
         if (this.now() >= Date.parse(this.authority.policy.expiresAt)) break;
+        const pauseFile = resolve(this.store.directory, "pause.json"), continueFile = resolve(this.store.directory, "continue.json");
+        if (await pathExists(pauseFile)) { await this.pause(); await unlink(pauseFile); }
+        if (await pathExists(continueFile)) { if (this.data.lifecycle === "paused") await this.continue(); await unlink(continueFile); }
+        if (this.data.lifecycle === "paused") { await new Promise(r => setTimeout(r, 250)); continue; }
         await this.drainLocalSubmissions();
         if (!(await this.step())) await new Promise(resolveDelay => setTimeout(resolveDelay, 250));
       }
@@ -498,8 +615,9 @@ export class SwarmSessionSupervisor {
       try {
         const bytes = await readFile(resolve(directory, name));
         if (bytes.length > this.authority.policy.limits.payloadBytes + 256) throw new BridgeError("Submission too large");
-        const value = JSON.parse(bytes.toString()) as { alias: PeerAlias; proposal: WorkProposal };
-        const taskId = await this.submit(value.alias, value.proposal); await atomicWriteJson(marker, { status: "accepted", taskId });
+        const value = JSON.parse(bytes.toString()) as { alias: PeerAlias; proposal: WorkProposal; operator?: OperatorTask };
+        const taskId = value.operator ? await this.submitOperator(value.operator) : await this.submit(value.alias, value.proposal);
+        await atomicWriteJson(marker, { status: "accepted", taskId });
       } catch { await atomicWriteJson(marker, { status: "rejected" }); }
     }
   }
