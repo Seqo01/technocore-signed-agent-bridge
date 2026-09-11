@@ -25,10 +25,12 @@ import { discoveryCommand } from "./discovery/cli.js";
 import { formatDiscoveryFailureDiagnostics } from "./discovery/diagnostics.js";
 import { isOutboundExternalWorkCommand, outboundExternalWorkCommand } from "./swarm/outbound-external-work-cli.js";
 import { externalBootstrapCommand, isExternalBootstrapCommand } from "./swarm/external-bootstrap-cli.js";
+import { dashboardCommand } from "./dashboard/cli.js";
 
 function usage(): never {
   throw new BridgeError(
     "usage: identity:create <name> | identity:inspect <name> | " +
+    "dashboard --policy <file> OR --session <id> [--port <port>] | " +
     "discovery:rooms | discovery:events | discovery:room <public-room> | discovery:did <did> (network flags: see DISCOVERY.md) | discovery:candidates | discovery:inspect <id> | discovery:summary | " +
     "inference:usage <ledger-file> [--session <id>] [--did <public-did>] | " +
     "external-work:prepare <request-file> | external-work:status <job> | external-work:authorize <job> <action-hash> | " +
@@ -80,6 +82,7 @@ function liveTransport(): HttpTechnocoreTransport {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
+  if (command === "dashboard") { await dashboardCommand(args); return; }
   if (command.startsWith("discovery:")) { await discoveryCommand(command, args); return; }
   if (isExternalBootstrapCommand(command)) { await externalBootstrapCommand(command, args); return; }
   if (isOutboundExternalWorkCommand(command)) { await outboundExternalWorkCommand(command, args); return; }

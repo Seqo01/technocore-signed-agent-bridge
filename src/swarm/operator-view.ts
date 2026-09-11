@@ -11,7 +11,7 @@ import { BridgeError } from "../errors.js";
 import { SessionStateStore, sessionDirectory, classifyInterruptedSession } from "./session-state.js";
 import type { TaskEvidence } from "../agent/evidence.js";
 import { readJsonFile, pathExists } from "../fs-safe.js";
-interface TaskView { taskId: string; jobId: string; agent: string; compute: string; delivery: string; createdAt: string;
+export interface TaskView { taskId: string; jobId: string; agent: string; compute: string; delivery: string; createdAt: string;
   runtimeStatus?: string; updatedAt?: string; startedAt?: string; finishedAt?: string; result?: unknown; provenance?: TaskEvidence; reviewOutcome?: unknown;
   reviewReasons?: unknown; unresolved?: unknown; failureCode?: string }
 

@@ -158,6 +158,8 @@ export class SwarmSessionSupervisor {
   }
   private get data(): PeerSession { return this.store.value; }
   snapshot(): PeerSession { return structuredClone(this.data); }
+  /** Local UI reads/intake share the owner queue; they must not race checkpoint replacement. */
+  atOperatorBoundary<T>(operation: () => Promise<T>): Promise<T> { return this.serial(operation); }
   private async restoreOfflineTasks(): Promise<void> {
     for (const e of Object.values(this.data.effects)) if (e.status !== "received") {
       if (e.status !== "failed") e.status = "ambiguous";
@@ -623,16 +625,18 @@ export class SwarmSessionSupervisor {
   }
   async stop(): Promise<void> {
     this.stopRequested = true;
-    await this.queue; // Each inference/read/write is bounded; no new operation can dispatch after stopRequested.
-    if (this.closed) return;
-    for (const e of Object.values(this.data.effects)) if (["sending", "receiving"].includes(e.status)) e.status = "ambiguous";
-    if (this.data.lifecycle !== "halted") this.data.lifecycle = "stopping";
-    try { await this.store.save(); }
-    finally {
-      await this.release();
-      if (this.data.lifecycle !== "halted") this.data.lifecycle = "stopped";
-      await this.store.save();
-    }
+    // Include final checkpoint writes in the owner queue, including operator reads.
+    await this.serial(async () => {
+      if (this.closed) return;
+      for (const e of Object.values(this.data.effects)) if (["sending", "receiving"].includes(e.status)) e.status = "ambiguous";
+      if (this.data.lifecycle !== "halted") this.data.lifecycle = "stopping";
+      try { await this.store.save(); }
+      finally {
+        await this.release();
+        if (this.data.lifecycle !== "halted") this.data.lifecycle = "stopped";
+        await this.store.save();
+      }
+    });
   }
   private async release(): Promise<void> {
     this.closed = true;

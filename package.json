@@ -9,6 +9,8 @@
     "node": ">=22"
   },
   "scripts": {
+    "dashboard": "npm run build --silent && node dist/src/cli.js dashboard",
+    "test:dashboard": "npm run build --silent && node --test dist/tests/dashboard.test.js",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build --silent && node --test \"dist/tests/*.test.js\"",

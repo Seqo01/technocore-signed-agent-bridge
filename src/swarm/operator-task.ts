@@ -6,6 +6,29 @@ import { assertNoSecretLikeOutput } from "../workloads/types.js";
 import { validateWorkRequest } from "./router.js";
 import { peerAliases, type PeerAlias, type SessionAuthority, type RootProvenance } from "./session-policy.js";
 import type { TaskEvidence } from "../agent/evidence.js";
+import { SessionAuthority as Authority } from "./session-policy.js";
+import { SessionStateStore, sessionDirectory } from "./session-state.js";
+import { atomicCreateJson, pathExists } from "../fs-safe.js";
+
+/** Shared durable operator intake for the CLI and local dashboard. Never executes a task. */
+export async function queueOperatorTask(root: string, sessionId: string, value: unknown) {
+  const operator = validateOperatorTask(value), state = await SessionStateStore.read(root, sessionId);
+  let alive = false; try { process.kill(state.pid, 0); alive = true; } catch { /* Not running. */ }
+  if (state.policy.mode !== "offline" || !["active", "paused"].includes(state.lifecycle) || !alive) {
+    throw new BridgeError("Task requires a running or paused OFFLINE session");
+  }
+  validateOperatorAuthority(new Authority(state.policy, state.policyHash), operator);
+  const submissionId = hashValue({ session: state.sessionId, operator });
+  const did = state.policy.members.find(m => m.alias === operator.flow[0])!.did;
+  const jobId = hashValue({ session: state.sessionId, root: submissionId, requester: did });
+  if (Buffer.byteLength(JSON.stringify({ operator })) > state.policy.limits.payloadBytes) throw new BridgeError("Task exceeds session input bound");
+  const path = resolve(sessionDirectory(root, state.sessionId), "submissions", `${submissionId}.json`);
+  if (!await pathExists(path)) {
+    try { await atomicCreateJson(path, { operator }); }
+    catch (error) { if (!await pathExists(path)) throw error; }
+  }
+  return { submissionId, jobId, roleFlow: operator.flow, status: "queued-local-only", testingOnly: true };
+}
 
 /** Local operator input, not a new peer protocol. Source is data, never executed/fetched. */
 export interface OperatorTask { objective: string; acceptanceCriteria: string[]; flow: PeerAlias[]; source?: string }

@@ -64,6 +64,11 @@ npm.cmd run test:peer
 There is no configured real inference provider in the CLI and no automatic live
 fallback. See [peer session commands and limits](PEER-SESSIONS.md#commands).
 
+For a localhost browser interface to the same runtime, see [Local Dashboard v1](DASHBOARD.md):
+`npm run dashboard -- --session YOUR_EXISTING_SESSION_ID`. START/STOP/PAUSE/RESUME,
+operator tasks and persisted results are available with explicitly testing-only mock inference.
+Passphrases stay in the launching terminal; no live network or autonomous mode is enabled.
+
 For standalone operation without Codex, the [offline operator workflow](PEER-SESSIONS.md#standalone-offline-operator-workflow)
 adds `swarm:policy`, `swarm:task`, `swarm:result`, `swarm:pause`, `swarm:continue`
 and explicit `swarm:resume` around the existing runtime. Submit your own bounded

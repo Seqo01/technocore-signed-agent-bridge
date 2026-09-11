@@ -9,7 +9,7 @@ import { CapabilityRegistry, SessionAuthority, PEER_ROLES, peerAliases, type Pee
 import { SessionStateStore, sessionDirectory, classifyInterruptedSession } from "./session-state.js";
 import { SwarmSessionSupervisor } from "./supervisor.js";
 import { validateProposal } from "./proposal.js";
-import { operatorWorkload, readOperatorTask, validateFlow, validateOperatorAuthority } from "./operator-task.js";
+import { operatorWorkload, readOperatorTask, validateFlow, queueOperatorTask } from "./operator-task.js";
 import { operatorView } from "./operator-view.js";
 import { AgentRoleStore } from "../agent/roles.js";
 import { agentPaths } from "../agent/paths.js";
@@ -55,17 +55,7 @@ export async function peerSessionCommand(command: string, args: string[]): Promi
   }
   if (command === "swarm:task") {
     if (args.length !== 3) throw new BridgeError("Expected task file --session id");
-    const operator = await readOperatorTask(args[0]!), state = await SessionStateStore.read(root, option(args, "--session"));
-    if (state.policy.mode !== "offline" || !["active", "paused"].includes(state.lifecycle) || !alive(state.pid)) throw new BridgeError("Task requires a running or paused OFFLINE session");
-    validateOperatorAuthority(new SessionAuthority(state.policy, state.policyHash), operator);
-    const submissionId = hashValue({ session: state.sessionId, operator });
-    const proposalId = submissionId;
-    const did = state.policy.members.find(m => m.alias === operator.flow[0])!.did;
-    const jobId = hashValue({ session: state.sessionId, root: proposalId, requester: did });
-    const path = resolve(sessionDirectory(root, state.sessionId), "submissions", `${submissionId}.json`);
-    if (Buffer.byteLength(JSON.stringify({ operator })) > state.policy.limits.payloadBytes) throw new BridgeError("Task exceeds session input bound");
-    if (!await pathExists(path)) await atomicCreateJson(path, { operator });
-    console.log(JSON.stringify({ submissionId, jobId, roleFlow: operator.flow, status: "queued-local-only", testingOnly: true })); return;
+    console.log(JSON.stringify(await queueOperatorTask(root, option(args, "--session"), await readOperatorTask(args[0]!)))); return;
   }
   if (command === "swarm:result") {
     if (args.length !== 2) throw new BridgeError("Expected session id and job id");
