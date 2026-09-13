@@ -3,7 +3,7 @@ import { after, before, test } from "node:test";
 import { cp } from "node:fs/promises";
 import { request } from "node:http";
 import { Socket } from "node:net";
-import { Script } from "node:vm";
+import { Script, createContext } from "node:vm";
 import { resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createStores } from "../src/context.js";
@@ -277,4 +277,94 @@ test("static assets are local, CSP fenced, no-store and JavaScript parses", asyn
 });
 test("CLI rejects missing, duplicate, unknown and remote-bind arguments", async () => {
   for (const args of [[], ["--policy","x","--session","x"], ["--host","0.0.0.0"], ["--session","x","--session","y"]]) await assert.rejects(dashboardCommand(args));
+});
+
+/** Small DOM seam for presentation only; the existing controller tests own lifecycle rules. */
+function uiFixture() {
+  class Element {
+    textContent = ""; className = ""; hidden = false; disabled = false; tabIndex = -1;
+    dataset: Record<string, string> = {}; attributes: Record<string, string> = {};
+    children: Element[] = []; handlers: Record<string, () => void> = {}; focused = false;
+    classList = { toggle: (name: string, on: boolean) => {
+      const classes = new Set(this.className.split(" ").filter(Boolean));
+      if (on) classes.add(name); else classes.delete(name); this.className = [...classes].join(" ");
+    } };
+    constructor(readonly tag = "div") {}
+    append(...nodes: Element[]) { this.children.push(...nodes); }
+    replaceChildren(...nodes: Element[]) { this.children = nodes; }
+    setAttribute(key: string, value: string) { this.attributes[key] = value; }
+    addEventListener(name: string, fn: () => void) { this.handlers[name] = fn; }
+    querySelector(tag: string): Element | undefined { return this.children.find(n => n.tag === tag); }
+    focus() { this.focused = true; }
+    scrollIntoView() { /* No layout in this presentation seam. */ }
+  }
+  const elements = new Map<string, Element>();
+  const get = (id: string) => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id)!; };
+  const context = createContext({ document: { getElementById: get, createElement: (tag: string) => new Element(tag), hidden: false },
+    fetch: () => new Promise(() => {}), AbortSignal, setInterval: () => 0 });
+  new Script(javascript).runInContext(context);
+  return { get, context, run: (code: string) => new Script(code).runInContext(context) as unknown };
+}
+
+test("UI emphasizes only a permitted lifecycle action, including stopped and paused RESUME", () => {
+  const ui = uiFixture();
+  for (const [state, allowed, primary] of [
+    ["NOT STARTED", { start: true }, "start"], ["STOPPED", { resume: true }, "resume"],
+    ["PAUSED", { resume: true, stop: true }, "resume"], ["RUNNING", { pause: true, stop: true }, "pause"],
+    ["STOPPED", {}, null],
+  ] as const) {
+    ui.context.fixture = { view: { state }, allowed };
+    ui.run("current=fixture; blocked=false; controls()");
+    for (const action of ["start", "stop", "pause", "resume"]) {
+      assert.equal(ui.get(action).className.includes("primary"), action === primary);
+      assert.equal(ui.get(action).disabled, !Reflect.get(allowed, action));
+    }
+  }
+  ui.run("blocked=true; controls()");
+  assert.ok(ui.get("resume").disabled); assert.doesNotMatch(ui.get("resume").className, /primary/u);
+});
+
+test("UI renders real counts, literal agent states and untrusted text without HTML", async () => {
+  const f = await fixture(); try {
+    const ui = uiFixture(); ui.context.fixture = await f.controller.view(); ui.run("render(fixture)");
+    assert.equal(ui.get("metrics").children.length, 8);
+    assert.ok(ui.get("metrics").children.every(n => n.children[0]!.textContent === "—"));
+    await control(f.controller, "start"); ui.context.fixture = await f.controller.view(); ui.run("render(fixture)");
+    assert.equal(ui.get("metrics").children[4]!.children[0]!.textContent, "0");
+    assert.equal(ui.get("agents").children.length, 5);
+    assert.equal(ui.get("agents").children[1]!.children[0]!.children[1]!.textContent, "idle");
+    ui.run("render({...fixture, sessionId:'<script>untrusted</script>'})");
+    assert.equal(ui.get("session-id").textContent, "<script>untrusted</script>");
+    assert.equal(ui.get("session-id").children.length, 0);
+  } finally { await f.close(); }
+});
+
+test("UI inspection separates results and provenance while retaining complete evidence", async () => {
+  const ui = uiFixture();
+  const result = "<script>not executable</script> " + "long-token".repeat(1000);
+  const evidence = { operatorTask: { objective: "UI fixture" }, view: { jobs: [],
+    tasks: [{ taskId: "ui-task", agent: "bob", compute: "result-ready", result, provenance: { testingOnly: true } }], inference: { attempts: 1 } } };
+  ui.context.evidence = evidence; ui.run("api=async()=>evidence"); await ui.run("inspect('ui-job')");
+  assert.equal(ui.get("inspection-results").children[0]!.children[2]!.textContent, result);
+  assert.equal(JSON.parse(ui.get("provenance").textContent).tasks[0].provenance.testingOnly, true);
+  assert.equal(JSON.parse(ui.get("result").textContent).tasks[0].result, result);
+  assert.equal(ui.get("inspection").focused, true);
+  ui.context.evidence = { ...evidence, view: { ...evidence.view, tasks: [] } };
+  await ui.run("inspect('empty-job')"); assert.match(ui.get("inspection-results").children[0]!.textContent, /No task results/u);
+  ui.get("close-inspection").handlers.click!(); assert.equal(ui.get("inspection").hidden, true);
+});
+
+test("UI ignores stale inspection responses and marks the selected job accessibly", async () => {
+  const ui = uiFixture();
+  ui.context.fixture = { sessionId: "ui-fixture", allowed: {}, agents: [], view: { state: "STOPPED", counts: {},
+    inference: { attempts: 0 }, tasks: [], jobs: [{ jobId: "one", status: "completed", roleFlow: ["bob"] }], submissions: [], recentActivity: [] } };
+  ui.run("render(fixture); api=()=>new Promise(resolve=>globalThis.finishInspection=resolve)");
+  const pending = ui.run("inspect('one')"); ui.get("close-inspection").handlers.click!();
+  ui.run("finishInspection({operatorTask:null,view:fixture.view})"); await pending;
+  assert.equal(ui.get("inspection").hidden, true);
+  ui.run("api=async()=>({operatorTask:null,view:fixture.view})"); await ui.run("inspect('one')");
+  const button = ui.get("jobs").children[0]!.querySelector("button")!;
+  assert.equal(button.attributes["aria-pressed"], "true");
+  ui.get("close-inspection").handlers.click!();
+  assert.equal(button.attributes["aria-pressed"], "false"); assert.equal(button.focused, true);
 });
